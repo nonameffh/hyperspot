@@ -9,6 +9,16 @@ release-plz updates this file in the Release PR.
 
 ## [Unreleased]
 
+## [0.2.9](https://github.com/nonameffh/hyperspot/compare/cf-modkit-v0.2.8...cf-modkit-v0.2.9) - 2026-02-13
+
+### Fixed
+
+- show colors on supported windows terminal (by @lansfy) - #590
+
+### Contributors
+
+* @lansfy
+
 ## [0.2.8](https://github.com/cyberfabric/cyberfabric-core/compare/types-sdk-v0.2.7...types-sdk-v0.2.8) - 2026-02-12
 
 ### Other
