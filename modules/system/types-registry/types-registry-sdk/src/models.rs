@@ -350,6 +350,23 @@ impl<C> RegisterResult<C> {
             Self::Err { error, .. } => Some(error),
         }
     }
+
+    /// Returns `Ok(())` if all results are successful, or the first error.
+    ///
+    /// Useful during module initialization to fail fast when GTS registration
+    /// encounters per-item errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first `TypesRegistryError` found in the results.
+    pub fn ensure_all_ok(results: &[Self]) -> Result<(), crate::TypesRegistryError> {
+        for result in results {
+            if let Self::Err { error, .. } = result {
+                return Err(error.clone());
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Type alias for dynamic register results using `serde_json::Value` as content.

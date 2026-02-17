@@ -34,22 +34,27 @@ fn main() {
         Uuid::parse_str("550e8400-e29b-41d4-a716-446655440001").expect("valid subject UUID");
 
     let ctx = SecurityContext::builder()
-        .tenant_id(tenant_id)
+        .subject_tenant_id(tenant_id)
         .subject_id(subject_id)
         .subject_type("user")
-        .build();
+        .build()
+        .expect("valid security context");
 
     let secured = client.security_ctx(&ctx);
 
     println!("Client base URL: {}", secured.client().get_base_url());
-    println!("Tenant ID: {}", secured.ctx().tenant_id());
+    println!("Tenant ID: {}", secured.ctx().subject_tenant_id());
     println!("Subject ID: {}", secured.ctx().subject_id());
 
     // Context for internal operations (still scoped to a tenant)
-    let internal_ctx = SecurityContext::builder().tenant_id(tenant_id).build();
+    let internal_ctx = SecurityContext::builder()
+        .subject_tenant_id(tenant_id)
+        .subject_id(subject_id)
+        .build()
+        .expect("valid security context");
     let secured_internal = client.security_ctx(&internal_ctx);
 
     println!("\nInternal context:");
-    println!("Tenant ID: {}", secured_internal.ctx().tenant_id());
+    println!("Tenant ID: {}", secured_internal.ctx().subject_tenant_id());
     println!("Subject ID: {}", secured_internal.ctx().subject_id());
 }

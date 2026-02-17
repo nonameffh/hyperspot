@@ -3004,15 +3004,20 @@ impl Module for VendorPlugin {
 
 - Resolve plugin instance lazily (on first use)
 - Query types-registry for instances of `<Module>PluginSpecV1`
-- Choose by `vendor` and lowest `priority`
+- Use `modkit::plugins::choose_plugin_instance` to select by `vendor` and lowest `priority`
 - Get scoped client via `ClientScope::gts_id(instance_id)`
+
+**Rule:** Use the shared `choose_plugin_instance` function from `modkit::plugins` — do **not** copy the selection logic into each module.
+
+The function is generic over the plugin spec type `P` and accepts any iterator of `(&str, &serde_json::Value)` pairs (GTS ID + content).
+Add `From<ChoosePluginError> for DomainError` in `domain/error.rs`.
 
 ```rust
 // <module>/src/domain/service.rs
 use std::sync::Arc;
 
 use modkit::client_hub::{ClientHub, ClientScope};
-use modkit::plugins::GtsPluginSelector;
+use modkit::plugins::{GtsPluginSelector, choose_plugin_instance};
 use modkit_macros::domain_model;
 use types_registry_sdk::{ListQuery, TypesRegistryClient};
 
@@ -3045,7 +3050,27 @@ impl Service {
             )
             .await?;
 
-        choose_plugin_instance(&self.vendor, &instances)
+        // Shared selection: filters by vendor, picks lowest priority
+        Ok(choose_plugin_instance::<MyModulePluginSpecV1>(
+            &self.vendor,
+            instances.iter().map(|e| (e.gts_id.as_str(), &e.content)),
+        )?)
+    }
+}
+```
+
+```rust
+// <module>/src/domain/error.rs — add this conversion
+impl From<modkit::plugins::ChoosePluginError> for DomainError {
+    fn from(e: modkit::plugins::ChoosePluginError) -> Self {
+        match e {
+            modkit::plugins::ChoosePluginError::InvalidPluginInstance { gts_id, reason } => {
+                Self::InvalidPluginInstance { gts_id, reason }
+            }
+            modkit::plugins::ChoosePluginError::PluginNotFound { vendor } => {
+                Self::PluginNotFound { vendor }
+            }
+        }
     }
 }
 ```

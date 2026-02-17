@@ -67,6 +67,7 @@
 //! - Used by both REST API (`OpenAPI`) and domain pagination
 //! - Mapped to database columns in `infra::storage::odata_mapper`
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 // === PUBLIC API (from SDK) ===
 pub use users_info_sdk::{
     Address, AddressPatch, City, CityPatch, NewAddress, NewCity, NewUser, UpdateAddressRequest,

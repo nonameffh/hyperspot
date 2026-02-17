@@ -2,7 +2,10 @@ use std::future::Future;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
+use serde::de::DeserializeOwned;
 use tokio::sync::Mutex;
+
+use crate::gts::BaseModkitPluginV1;
 
 /// A resettable, allocation-friendly selector for GTS plugin instance IDs.
 ///
@@ -83,6 +86,109 @@ impl GtsPluginSelector {
         let mut guard = self.cached.write();
         guard.take().is_some()
     }
+}
+
+/// Error returned by [`choose_plugin_instance`].
+#[derive(Debug, thiserror::Error)]
+pub enum ChoosePluginError {
+    /// Failed to deserialize a plugin instance's content.
+    #[error("invalid plugin instance content for '{gts_id}': {reason}")]
+    InvalidPluginInstance {
+        /// GTS ID of the malformed instance.
+        gts_id: String,
+        /// Human-readable reason.
+        reason: String,
+    },
+
+    /// No plugin instance matched the requested vendor.
+    #[error("no plugin instances found for vendor '{vendor}'")]
+    PluginNotFound {
+        /// The vendor that was requested.
+        vendor: String,
+    },
+}
+
+/// Selects the best plugin instance for the given vendor.
+///
+/// Accepts an iterator of `(gts_id, content)` pairs — typically
+/// produced from `types_registry_sdk::GtsEntity`:
+///
+/// ```ignore
+/// choose_plugin_instance::<MyPluginSpecV1>(
+///     &self.vendor,
+///     instances.iter().map(|e| (e.gts_id.as_str(), &e.content)),
+/// )
+/// ```
+///
+/// Deserializes each entry as `BaseModkitPluginV1<P>`, filters by
+/// `vendor`, and returns the `gts_id` of the instance with the
+/// **lowest** priority value.
+///
+/// # Type Parameters
+///
+/// - `P` — The plugin-specific properties struct (e.g.
+///   `AuthNResolverPluginSpecV1`). Must be `DeserializeOwned`.
+///
+/// # Errors
+///
+/// - [`ChoosePluginError::InvalidPluginInstance`] if deserialization fails
+///   or the `content.id` doesn't match `gts_id`.
+/// - [`ChoosePluginError::PluginNotFound`] if no instance matches the vendor.
+pub fn choose_plugin_instance<'a, P>(
+    vendor: &str,
+    instances: impl IntoIterator<Item = (&'a str, &'a serde_json::Value)>,
+) -> Result<String, ChoosePluginError>
+where
+    P: DeserializeOwned + gts::GtsSchema,
+{
+    let mut best: Option<(&str, i16)> = None;
+    let mut count: usize = 0;
+
+    for (gts_id, content_val) in instances {
+        count += 1;
+        let content: BaseModkitPluginV1<P> =
+            serde_json::from_value(content_val.clone()).map_err(|e| {
+                tracing::error!(
+                    gts_id = %gts_id,
+                    error = %e,
+                    "Failed to deserialize plugin instance content"
+                );
+                ChoosePluginError::InvalidPluginInstance {
+                    gts_id: gts_id.to_owned(),
+                    reason: e.to_string(),
+                }
+            })?;
+
+        if content.id != gts_id {
+            return Err(ChoosePluginError::InvalidPluginInstance {
+                gts_id: gts_id.to_owned(),
+                reason: format!(
+                    "content.id mismatch: expected {:?}, got {:?}",
+                    gts_id, content.id
+                ),
+            });
+        }
+
+        if content.vendor != vendor {
+            continue;
+        }
+
+        match &best {
+            None => best = Some((gts_id, content.priority)),
+            Some((_, cur_priority)) => {
+                if content.priority < *cur_priority {
+                    best = Some((gts_id, content.priority));
+                }
+            }
+        }
+    }
+
+    tracing::debug!(vendor, instance_count = count, "choose_plugin_instance");
+
+    best.map(|(gts_id, _)| gts_id.to_owned())
+        .ok_or_else(|| ChoosePluginError::PluginNotFound {
+            vendor: vendor.to_owned(),
+        })
 }
 
 #[cfg(test)]

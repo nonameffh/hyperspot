@@ -42,7 +42,7 @@ pub struct Scoped {
 /// ```rust,ignore
 /// use modkit_db::secure::{AccessScope, SecureEntityExt};
 ///
-/// let scope = AccessScope::tenants_only(vec![tenant_id]);
+/// let scope = AccessScope::for_tenants(vec![tenant_id]);
 /// let users = user::Entity::find()
 ///     .secure()           // Returns SecureSelect<E, Unscoped>
 ///     .scope_with(&scope) // Returns SecureSelect<E, Scoped>
@@ -81,7 +81,7 @@ pub struct SecureSelect<E: EntityTrait, S> {
 /// ```rust,ignore
 /// use modkit_db::secure::{AccessScope, SecureEntityExt};
 ///
-/// let scope = AccessScope::tenants_only(vec![tenant_id]);
+/// let scope = AccessScope::for_tenants(vec![tenant_id]);
 /// let rows: Vec<(fruit::Model, Option<cake::Model>)> = Fruit::find()
 ///     .secure()
 ///     .scope_with(&scope)
@@ -113,7 +113,7 @@ pub struct SecureSelectTwo<E: EntityTrait, F: EntityTrait, S> {
 /// ```rust,ignore
 /// use modkit_db::secure::{AccessScope, SecureEntityExt};
 ///
-/// let scope = AccessScope::tenants_only(vec![tenant_id]);
+/// let scope = AccessScope::for_tenants(vec![tenant_id]);
 /// let rows: Vec<(cake::Model, Vec<fruit::Model>)> = Cake::find()
 ///     .secure()
 ///     .scope_with(&scope)
@@ -300,11 +300,13 @@ where
 
     /// Apply scoping for a joined entity.
     ///
-    /// This is useful when you need to filter by tenant on a joined table.
+    /// This delegates to `build_scope_condition::<J>()` which handles all
+    /// property types (tenant, resource, owner, custom PEP properties) with
+    /// proper OR/AND constraint semantics.
     ///
     /// # Example
     /// ```ignore
-    /// // Select orders, ensuring both Order and Customer match tenant scope
+    /// // Select orders, ensuring both Order and Customer match scope
     /// Order::find()
     ///     .secure()
     ///     .scope_with(&scope)?
@@ -317,13 +319,8 @@ where
         J: ScopableEntity + EntityTrait,
         J::Column: ColumnTrait + Copy,
     {
-        if !scope.tenant_ids().is_empty()
-            && let Some(tcol) = J::tenant_col()
-        {
-            let condition = sea_orm::Condition::all()
-                .add(Expr::col((J::default(), tcol)).is_in(scope.tenant_ids().to_vec()));
-            self.inner = QueryFilter::filter(self.inner, condition);
-        }
+        let cond = build_scope_condition::<J>(scope);
+        self.inner = QueryFilter::filter(self.inner, cond);
         self
     }
 
@@ -332,16 +329,20 @@ where
     /// This is particularly useful when the base entity doesn't have a tenant column
     /// but is related to one that does.
     ///
+    /// This delegates to `build_scope_condition::<J>()` for the EXISTS subquery,
+    /// handling all property types with proper OR/AND constraint semantics.
+    ///
     /// # Note
-    /// This is a simplified version that filters by tenant on the joined entity.
-    /// For complex join predicates, use `into_inner()` and build custom EXISTS clauses.
+    /// This is a simplified EXISTS check (no join predicate linking back to the
+    /// primary entity). For complex join predicates, use `into_inner()` and build
+    /// custom EXISTS clauses.
     ///
     /// # Example
     /// ```ignore
-    /// // Find settings that exist in a tenant-scoped relationship
+    /// // Find settings that exist in a scoped relationship
     /// GlobalSetting::find()
     ///     .secure()
-    ///     .scope_with(&AccessScope::resources_only(vec![]))?
+    ///     .scope_with(&AccessScope::for_resources(vec![]))?
     ///     .scope_via_exists::<TenantSetting>(&scope)
     ///     .all(conn)
     ///     .await?
@@ -351,20 +352,15 @@ where
         J: ScopableEntity + EntityTrait,
         J::Column: ColumnTrait + Copy,
     {
-        if !scope.tenant_ids().is_empty()
-            && let Some(tcol) = J::tenant_col()
-        {
-            // Build EXISTS clause with tenant filter on joined entity
-            use sea_orm::sea_query::Query;
+        use sea_orm::sea_query::Query;
 
-            let mut sub = Query::select();
-            sub.expr(Expr::value(1))
-                .from(J::default())
-                .cond_where(Expr::col((J::default(), tcol)).is_in(scope.tenant_ids().to_vec()));
+        let cond = build_scope_condition::<J>(scope);
 
-            self.inner =
-                QueryFilter::filter(self.inner, sea_orm::Condition::all().add(Expr::exists(sub)));
-        }
+        let mut sub = Query::select();
+        sub.expr(Expr::value(1)).from(J::default()).cond_where(cond);
+
+        self.inner =
+            QueryFilter::filter(self.inner, sea_orm::Condition::all().add(Expr::exists(sub)));
         self
     }
 
@@ -383,22 +379,22 @@ where
 // Relationship Query Methods on SecureSelect<E, Scoped>
 // =============================================================================
 
-/// Helper to apply scope filtering to a related entity if it has a tenant column.
+/// Build scope condition for a related entity, returning `None` for unrestricted entities.
+///
+/// Delegates to `build_scope_condition::<R>()` which handles all property types
+/// (tenant, resource, owner, custom PEP properties) with proper OR/AND semantics.
+///
+/// Returns `None` when the scope is unconstrained (allow-all), so the caller
+/// can skip adding a no-op filter.
 fn apply_related_scope<R>(scope: &AccessScope) -> Option<sea_orm::Condition>
 where
     R: ScopableEntity + EntityTrait,
     R::Column: ColumnTrait + Copy,
 {
-    if !scope.tenant_ids().is_empty()
-        && let Some(tcol) = R::tenant_col()
-    {
-        Some(
-            sea_orm::Condition::all()
-                .add(Expr::col((R::default(), tcol)).is_in(scope.tenant_ids().to_vec())),
-        )
-    } else {
-        None
+    if scope.is_unconstrained() {
+        return None;
     }
+    Some(build_scope_condition::<R>(scope))
 }
 
 impl<E> SecureSelect<E, Scoped>
@@ -444,7 +440,7 @@ where
     ///
     /// # Example
     /// ```rust,ignore
-    /// let scope = AccessScope::tenants_only(vec![tenant_id]);
+    /// let scope = AccessScope::for_tenants(vec![tenant_id]);
     ///
     /// // Tenant-scoped related entity - scope is auto-applied to Customer
     /// let rows: Vec<(order::Model, Option<customer::Model>)> = Order::find()
@@ -505,7 +501,7 @@ where
     ///
     /// # Example
     /// ```rust,ignore
-    /// let scope = AccessScope::tenants_only(vec![tenant_id]);
+    /// let scope = AccessScope::for_tenants(vec![tenant_id]);
     ///
     /// // Tenant-scoped related entity - scope is auto-applied to LineItem
     /// let rows: Vec<(order::Model, Vec<line_item::Model>)> = Order::find()
@@ -752,6 +748,7 @@ where
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use modkit_security::pep_properties;
 
     // Note: Full integration tests with real SeaORM entities should be written
     // in application code where actual entities are available.
@@ -771,26 +768,37 @@ mod tests {
         let scoped = Scoped {
             scope: Arc::new(scope),
         };
-        assert!(!scoped.scope.has_tenants()); // default scope has no tenants
+        assert!(!scoped.scope.has_property(pep_properties::OWNER_TENANT_ID)); // default scope has no tenants
     }
 
     #[test]
     fn test_scoped_state_holds_scope() {
         let tenant_id = uuid::Uuid::new_v4();
-        let scope = AccessScope::tenants_only(vec![tenant_id]);
+        let scope = AccessScope::for_tenants(vec![tenant_id]);
         let scoped = Scoped {
             scope: Arc::new(scope),
         };
 
         // Verify the scope is accessible
-        assert!(scoped.scope.has_tenants());
-        assert_eq!(scoped.scope.tenant_ids().len(), 1);
-        assert!(scoped.scope.tenant_ids().contains(&tenant_id));
+        assert!(scoped.scope.has_property(pep_properties::OWNER_TENANT_ID));
+        assert_eq!(
+            scoped
+                .scope
+                .all_values_for(pep_properties::OWNER_TENANT_ID)
+                .len(),
+            1
+        );
+        assert!(
+            scoped
+                .scope
+                .all_uuid_values_for(pep_properties::OWNER_TENANT_ID)
+                .contains(&tenant_id)
+        );
     }
 
     #[test]
     fn test_scoped_state_is_cloneable() {
-        let scope = AccessScope::tenants_only(vec![uuid::Uuid::new_v4()]);
+        let scope = AccessScope::for_tenants(vec![uuid::Uuid::new_v4()]);
         let scoped = Scoped {
             scope: Arc::new(scope),
         };

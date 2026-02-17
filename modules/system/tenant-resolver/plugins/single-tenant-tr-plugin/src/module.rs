@@ -9,7 +9,7 @@ use modkit::context::ModuleCtx;
 use modkit::gts::BaseModkitPluginV1;
 use tenant_resolver_sdk::{TenantResolverPluginClient, TenantResolverPluginSpecV1};
 use tracing::info;
-use types_registry_sdk::TypesRegistryClient;
+use types_registry_sdk::{RegisterResult, TypesRegistryClient};
 
 use crate::domain::Service;
 
@@ -56,7 +56,8 @@ impl Module for SingleTenantTrPlugin {
         };
         let instance_json = serde_json::to_value(&instance)?;
 
-        let _ = registry.register(vec![instance_json]).await?;
+        let results = registry.register(vec![instance_json]).await?;
+        RegisterResult::ensure_all_ok(&results)?;
 
         // Create service and register scoped client in ClientHub
         let service = Arc::new(Service);

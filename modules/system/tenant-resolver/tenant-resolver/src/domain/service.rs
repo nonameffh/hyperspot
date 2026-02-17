@@ -7,8 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use modkit::client_hub::{ClientHub, ClientScope};
-use modkit::gts::BaseModkitPluginV1;
-use modkit::plugins::GtsPluginSelector;
+use modkit::plugins::{GtsPluginSelector, choose_plugin_instance};
 use modkit::telemetry::ThrottledLog;
 use modkit_macros::domain_model;
 use modkit_security::SecurityContext;
@@ -18,7 +17,7 @@ use tenant_resolver_sdk::{
     TenantResolverPluginSpecV1,
 };
 use tracing::info;
-use types_registry_sdk::{GtsEntity, ListQuery, TypesRegistryClient};
+use types_registry_sdk::{ListQuery, TypesRegistryClient};
 
 use super::error::DomainError;
 
@@ -103,7 +102,10 @@ impl Service {
             )
             .await?;
 
-        let gts_id = choose_plugin_instance(&self.vendor, &instances)?;
+        let gts_id = choose_plugin_instance::<TenantResolverPluginSpecV1>(
+            &self.vendor,
+            instances.iter().map(|e| (e.gts_id.as_str(), &e.content)),
+        )?;
         info!(plugin_gts_id = %gts_id, "Selected tenant resolver plugin instance");
 
         Ok(gts_id)
@@ -209,55 +211,4 @@ impl Service {
             .await
             .map_err(DomainError::from)
     }
-}
-
-/// Selects the best plugin instance for the given vendor.
-///
-/// If multiple instances match, the one with lowest priority wins.
-#[tracing::instrument(skip_all, fields(vendor, instance_count = instances.len()))]
-fn choose_plugin_instance(vendor: &str, instances: &[GtsEntity]) -> Result<String, DomainError> {
-    let mut best: Option<(String, i16)> = None;
-
-    for ent in instances {
-        let content: BaseModkitPluginV1<TenantResolverPluginSpecV1> =
-            serde_json::from_value(ent.content.clone()).map_err(|e| {
-                tracing::error!(
-                    gts_id = %ent.gts_id,
-                    error = %e,
-                    "Failed to deserialize plugin instance content"
-                );
-                DomainError::InvalidPluginInstance {
-                    gts_id: ent.gts_id.clone(),
-                    reason: e.to_string(),
-                }
-            })?;
-
-        if content.id != ent.gts_id {
-            return Err(DomainError::InvalidPluginInstance {
-                gts_id: ent.gts_id.clone(),
-                reason: format!(
-                    "content.id mismatch: expected {:?}, got {:?}",
-                    ent.gts_id, content.id
-                ),
-            });
-        }
-
-        if content.vendor != vendor {
-            continue;
-        }
-
-        match &best {
-            None => best = Some((ent.gts_id.clone(), content.priority)),
-            Some((_, cur_priority)) => {
-                if content.priority < *cur_priority {
-                    best = Some((ent.gts_id.clone(), content.priority));
-                }
-            }
-        }
-    }
-
-    best.map(|(gts_id, _)| gts_id)
-        .ok_or_else(|| DomainError::PluginNotFound {
-            vendor: vendor.to_owned(),
-        })
 }

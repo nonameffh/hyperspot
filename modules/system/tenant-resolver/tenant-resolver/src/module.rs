@@ -7,7 +7,7 @@ use modkit::Module;
 use modkit::context::ModuleCtx;
 use tenant_resolver_sdk::{TenantResolverClient, TenantResolverPluginSpecV1};
 use tracing::info;
-use types_registry_sdk::TypesRegistryClient;
+use types_registry_sdk::{RegisterResult, TypesRegistryClient};
 
 use crate::config::TenantResolverConfig;
 use crate::domain::{Service, TenantResolverLocalClient};
@@ -50,7 +50,8 @@ impl Module for TenantResolver {
         let registry = ctx.client_hub().get::<dyn TypesRegistryClient>()?;
         let schema_str = TenantResolverPluginSpecV1::gts_schema_with_refs_as_string();
         let schema_json: serde_json::Value = serde_json::from_str(&schema_str)?;
-        let _ = registry.register(vec![schema_json]).await?;
+        let results = registry.register(vec![schema_json]).await?;
+        RegisterResult::ensure_all_ok(&results)?;
         info!(
             schema_id = %TenantResolverPluginSpecV1::gts_schema_id(),
             "Registered plugin schema in types-registry"

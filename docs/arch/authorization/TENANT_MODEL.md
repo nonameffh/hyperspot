@@ -149,7 +149,7 @@ Two different tenant concepts appear in authorization:
 ```jsonc
 {
   "subject": {
-    "properties": { "tenant_id": "T1" }  // Subject tenant (optional)
+    "properties": { "tenant_id": "T1" }  // Subject tenant
   },
   "context": {
     "tenant_context": {
@@ -158,8 +158,8 @@ Two different tenant concepts appear in authorization:
     }
     // OR for subtree:
     // "tenant_context": {
-    //   "mode": "subtree",   // T1 + descendants
-    //   "root_id": "T1"
+    //   "mode": "subtree",   // T2 + descendants
+    //   "root_id": "T2"
     // }
   }
 }

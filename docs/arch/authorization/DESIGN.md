@@ -54,7 +54,7 @@ In Cyber Fabric's architecture:
 - **Resource Group** - Optional container for resources, used for access control. See [RESOURCE_GROUP_MODEL.md](./RESOURCE_GROUP_MODEL.md)
 - **Permission** - `{ resource_type, action }` - allowed operation identifier
 - **Access Constraints** - Structured predicates returned by the PDP for query-time enforcement. NOT policies (stored vendor-side) or "grants" (OAuth flows, Zanzibar tuples), but compiled, time-bound enforcement artifacts computed at evaluation time.
-- **Security Context** - Result of successful authentication containing subject identity, tenant information, and optionally the original bearer token. Flows from authentication to authorization. Required fields: `subject_id`, `token_scopes`. Optional fields: `subject_type`, `subject_tenant_id`, `bearer_token`.
+- **Security Context** - Result of successful authentication containing subject identity, tenant information, and optionally the original bearer token. Flows from authentication to authorization. Required fields: `subject_id`, `subject_tenant_id`, `token_scopes`. Optional fields: `subject_type`, `bearer_token`.
 - **Token Scopes** - Capability restrictions extracted from the access token. Act as a "ceiling" on what an application can do, regardless of user's actual permissions. See [Token Scopes](#token-scopes).
 
 ### Request Flow
@@ -294,7 +294,7 @@ AuthN Resolver plugin is responsible for:
 SecurityContext {
     subject_id: "user-123",
     subject_type: Some("gts.x.core.security.subject_user.v1~"),  // optional
-    subject_tenant_id: Some("tenant-456"),                       // optional
+    subject_tenant_id: "tenant-456",                             // required
     bearer_token: Some(Secret::new("eyJ...".into())),            // optional, Secret<String>
     token_scopes: ["*"],  // first-party: full access
     // OR
@@ -450,7 +450,7 @@ use secrecy::Secret;
 SecurityContext {
     subject_id: String,                    // required - from `sub` claim or IdP response
     subject_type: Option<GtsTypeId>,       // optional - vendor-specific subject type
-    subject_tenant_id: Option<TenantId>,   // optional - Subject Owner Tenant
+    subject_tenant_id: TenantId,           // required - Subject Owner Tenant
     token_scopes: Vec<String>,             // required - capability restrictions (["*"] for first-party)
     bearer_token: Option<Secret<String>>,  // optional - original token for forwarding to PDP
 }
@@ -462,7 +462,7 @@ SecurityContext {
 |-------|----------|-------------|---------|
 | `subject_id` | Yes | Unique identifier for the subject | All authorization decisions |
 | `subject_type` | No | GTS type identifier (e.g., `gts.x.core.security.subject_user.v1~`) | PDP for role/permission mapping |
-| `subject_tenant_id` | No | Subject Owner Tenant — tenant the subject belongs to | PDP for tenant context |
+| `subject_tenant_id` | Yes | Subject Owner Tenant — tenant the subject belongs to. Used as default `owner_tenant_id` for CREATE when the API has no explicit tenant field (see S06 in [AUTHZ_USAGE_SCENARIOS.md](./AUTHZ_USAGE_SCENARIOS.md)) | PDP for tenant context, PEP for resource ownership |
 | `token_scopes` | Yes | Capability restrictions from token (see [Token Scopes](#token-scopes)) | PDP for scope narrowing |
 | `bearer_token` | No | Original bearer token (wrapped in `Secret` from [secrecy](https://crates.io/crates/secrecy) crate) | PDP validation, external API calls |
 
@@ -631,7 +631,7 @@ The PEP MUST:
 1. **Validate decision** - `decision: false` or missing -> deny all (403 Forbidden)
 2. **Enforce require_constraints** - If `require_constraints: true` and `decision: true` but no `constraints` -> deny all (403 Forbidden)
 3. **Apply constraints when present** - If `constraints` array is present, apply to SQL; if all constraints evaluate to false -> deny all
-4. **Trust decision when constraints not required** - `decision: true` without `constraints` AND `require_constraints: false` -> allow (e.g., CREATE operations)
+4. **Trust decision when constraints not required** - `decision: true` without `constraints` AND `require_constraints: false` -> allow (non-resource decisions only; all standard CRUD operations use `require_constraints: true`)
 5. **Handle unreachable PDP** - Network failure, timeout -> deny all
 6. **Handle unknown predicate types** - Treat containing constraint as false; if all constraints false -> deny all
 7. **Handle empty or missing predicates** - If a constraint has empty `predicates: []` or missing `predicates` field -> treat constraint as malformed -> deny all. Constraints MUST have at least one predicate.
@@ -826,7 +826,7 @@ The response contains a `decision` and, when `decision: true`, optional `context
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `mode` | No | `"subtree"` | `"root_only"` (single tenant) or `"subtree"` (tenant + descendants) |
-| `root_id` | No | — | Root tenant ID. If absent, PDP determines from `token_scopes`, `bearer_token`, or `subject.properties.tenant_id` |
+| `root_id` | No | — | Root context tenant ID. If absent, PDP determines from `token_scopes`, `subject.properties.tenant_id`, or something else - it's fully up to the PDP implementation |
 | `barrier_mode` | No | `"all"` | `"all"` (respect barriers) or `"none"` (ignore barriers) |
 | `tenant_status` | No | — | Filter by tenant status (e.g., `["active", "suspended"]`) |
 
@@ -845,7 +845,7 @@ The `barrier_mode` and `tenant_status` parameters apply to any scope source — 
 
 #### Operation-Specific Behavior
 
-**CREATE** (no constraints needed):
+**CREATE** (PDP returns constraints, same as other operations):
 ```jsonc
 // PEP -> PDP
 {
@@ -853,14 +853,23 @@ The `barrier_mode` and `tenant_status` parameters apply to any scope source — 
   "resource": {
     "type": "gts.x.core.events.event.v1~",
     "properties": { "owner_tenant_id": "tenant-B", "topic_id": "..." }
-  }
-  // ... subject, context
+  },
+  "context": { "require_constraints": true }
+  // ... subject, tenant_context
 }
 
 // PDP -> PEP
-{ "decision": true }  // no constraints - PEP trusts decision
+{
+  "decision": true,
+  "context": {
+    "constraints": [
+      { "predicates": [{ "type": "eq", "resource_property": "owner_tenant_id", "value": "tenant-B" }] }
+    ]
+  }
+}
 
-// PEP: INSERT INTO events ...
+// PEP: compiles constraints, validates INSERT against them
+// INSERT INTO events ...
 ```
 
 **LIST** (constraints required):
@@ -1181,7 +1190,7 @@ The `require_constraints` field (separate from capabilities array) controls PEP 
 
 **Usage:**
 - For LIST operations: typically `true` (constraints needed for SQL WHERE)
-- For CREATE operations: typically `false` (no query, just permission check)
+- For CREATE operations: typically `false` (no query, just permission check), but can be `true` if PEP wants to enforce constraints locally
 - For GET/UPDATE/DELETE: depends on whether PEP wants SQL-level enforcement or trusts PDP decision
 
 #### Capabilities Array

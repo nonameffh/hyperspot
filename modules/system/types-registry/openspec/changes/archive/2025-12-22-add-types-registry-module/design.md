@@ -118,19 +118,19 @@ impl Module for TypesRegistryModule {
             entity_id_fields: cfg.entity_id_fields.clone(),
             // ... other GTS settings
         };
-        
+
         // Create storage with GTS config
         let storage = Arc::new(TypesRegistryStorage::new(gts_config));
         self.storage.store(Some(storage.clone()));
-        
+
         // Create local client and register in ClientHub
         let api: Arc<dyn TypesRegistryClient> = Arc::new(
             TypesRegistryLocalClient::new(storage)
         );
-        
+
         // Register in ClientHub directly - consumers use hub.get::<dyn TypesRegistryClient>()?
         ctx.client_hub().register::<dyn TypesRegistryClient>(api);
-        
+
         tracing::info!("Types registry module initialized");
         Ok(())
     }
@@ -184,30 +184,30 @@ pub struct TypesRegistryStorage {
 impl TypesRegistryClient for TypesRegistryLocalClient {
     async fn register(&self, ctx: &SecurityCtx, entities: Vec<Value>) -> Result<Vec<RegisterResult>, TypesRegistryError> {
         let mut results = Vec::with_capacity(entities.len());
-        
+
         for entity in entities {
             let result = if self.storage.is_production.load(Ordering::SeqCst) {
                 // Production: use gts-rust with validate=true
                 match self.storage.persistent.add_entity(&entity, true) {
                     Ok(gts_entity) => RegisterResult::Ok(gts_entity),
-                    Err(e) => RegisterResult::Err { 
-                        gts_id: extract_gts_id(&entity), 
-                        error: e.into() 
+                    Err(e) => RegisterResult::Err {
+                        gts_id: extract_gts_id(&entity),
+                        error: e.into()
                     },
                 }
             } else {
                 // Configuration: use gts-rust with validate=false
                 match self.storage.temporary.add_entity(&entity, false) {
                     Ok(gts_entity) => RegisterResult::Ok(gts_entity),
-                    Err(e) => RegisterResult::Err { 
-                        gts_id: extract_gts_id(&entity), 
-                        error: e.into() 
+                    Err(e) => RegisterResult::Err {
+                        gts_id: extract_gts_id(&entity),
+                        error: e.into()
                     },
                 }
             };
             results.push(result);
         }
-        
+
         Ok(results)
     }
 }
@@ -215,18 +215,18 @@ impl TypesRegistryClient for TypesRegistryLocalClient {
 impl TypesRegistryService {
     pub fn switch_to_production(&mut self) -> Result<(), Vec<ValidationError>> {
         let mut errors = Vec::new();
-        
+
         for (gts_id, _) in self.storage.temporary.store.items() {
             let result = self.storage.temporary.validate_entity(&gts_id);
             if !result.ok {
                 errors.push(ValidationError::new(&gts_id, &result.error));
             }
         }
-        
+
         if !errors.is_empty() {
             return Err(errors);
         }
-        
+
         self.storage.is_production.store(true, Ordering::SeqCst);
         Ok(())
     }

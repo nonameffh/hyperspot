@@ -103,15 +103,9 @@ modules:
           burst: 200
           in_flight: 64
 
-      # Authentication Configuration
-      # For local development, auth is disabled (uses root context)
+      # Authentication: disabled for local development (uses default root SecurityContext).
+      # Set to false to enable bearer-token auth via authn-resolver pipeline below.
       auth_disabled: true
-      require_auth_by_default: true
-      
-      # JWKS Configuration (uncomment when enabling authentication)
-      # jwks_uri: "http://localhost:8080/realms/dev/protocol/openid-connect/certs"
-      # issuer: "http://localhost:8080/realms/dev"
-      # audience: "api-gateway"
 
   module-orchestrator:
     config: {}
@@ -121,6 +115,28 @@ modules:
     config:
       # Use ephemeral port; OoP modules receive the actual bound address from master host
       listen_addr: "uds:///tmp/hyperspot-grpc"
+
+  # AuthN pipeline - used when auth_disabled: false.
+  # AuthZ pipeline - used always (with default root SecurityContext when auth is disabled).
+  # Requires --features static-authn,static-authz for the static plugins.
+  authn-resolver:
+    config:
+      vendor: "hyperspot"
+
+  authz-resolver:
+    config:
+      vendor: "hyperspot"
+
+  static-authn-plugin:
+    config:
+      vendor: "hyperspot"
+      priority: 100
+      mode: accept_all
+
+  static-authz-plugin:
+    config:
+      vendor: "hyperspot"
+      priority: 100
 
   simple-user-settings:
     # Module-specific database configuration
@@ -161,6 +177,8 @@ modules:
     config:
       default_page_size: 5
       max_page_size: 100
+      audit_base_url: "http://localhost:9090"
+      notifications_base_url: "http://localhost:9091"
 
   tenant-resolver:
     config:
