@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use authz_resolver_sdk::{AuthZResolverClient, AuthZResolverPluginSpecV1};
 use modkit::Module;
 use modkit::context::ModuleCtx;
+use modkit::contracts::SystemCapability;
 use tracing::info;
 use types_registry_sdk::{RegisterResult, TypesRegistryClient};
 
@@ -24,7 +25,7 @@ use crate::domain::{AuthZResolverLocalClient, Service};
 #[modkit::module(
     name = "authz-resolver",
     deps = ["types-registry"],
-    capabilities = []
+    capabilities = [system]
 )]
 pub(crate) struct AuthZResolver {
     service: OnceLock<Arc<Service>>,
@@ -37,6 +38,11 @@ impl Default for AuthZResolver {
         }
     }
 }
+
+// Marked as `system` so that init() runs in the system-module phase.
+// This ensures the AuthZResolver client is available in ClientHub before
+// other system modules that depend on it.
+impl SystemCapability for AuthZResolver {}
 
 #[async_trait]
 impl Module for AuthZResolver {

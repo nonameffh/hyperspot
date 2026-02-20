@@ -5,6 +5,7 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use modkit::Module;
 use modkit::context::ModuleCtx;
+use modkit::contracts::SystemCapability;
 use tenant_resolver_sdk::{TenantResolverClient, TenantResolverPluginSpecV1};
 use tracing::info;
 use types_registry_sdk::{RegisterResult, TypesRegistryClient};
@@ -24,7 +25,7 @@ use crate::domain::{Service, TenantResolverLocalClient};
 #[modkit::module(
     name = "tenant-resolver",
     deps = ["types-registry"],
-    capabilities = []
+    capabilities = [system]
 )]
 pub(crate) struct TenantResolver {
     service: OnceLock<Arc<Service>>,
@@ -37,6 +38,11 @@ impl Default for TenantResolver {
         }
     }
 }
+
+// Marked as `system` so that init() runs in the system-module phase.
+// This ensures the TenantResolver client is available in ClientHub before
+// other system modules that depend on it.
+impl SystemCapability for TenantResolver {}
 
 #[async_trait]
 impl Module for TenantResolver {
