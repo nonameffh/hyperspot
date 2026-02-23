@@ -103,7 +103,7 @@ roles) from the platform authentication middleware.
 - Shareable links with public, tenant, and tenant-hierarchy scopes
 - Signed URLs for unauthenticated, time-limited downloads
 - Link expiration and lifecycle management
-- Audit trail for all write operations
+- Audit trail for all write operations and optional read audit logging
 - Policies (file types, size limits, events, sharing restrictions) at tenant and user levels
 - Pluggable storage backend abstraction
 - Multipart (chunked) upload for large files
