@@ -1033,7 +1033,7 @@ changes.
 3. FileStorage checks authorization for write on `gts.x.fstorage.file` with the file type in resource context
 4. *(Phase 2)* FileStorage validates file against policies (type, size); in phase 1 all uploads are accepted
 5. FileStorage persists content, assigns ownership to the user, and stores metadata (including GTS file type)
-6. FileStorage emits audit record for the upload
+6. *(Phase 2)* FileStorage emits audit record for the upload
 7. FileStorage returns persistent URL and file identifier
 8. User creates a shareable link with desired scope and expiration
 9. FileStorage returns the shareable link URL
@@ -1042,7 +1042,7 @@ changes.
 
 - File stored with metadata and ownership
 - Shareable link active with configured scope and expiration
-- Audit record emitted
+- *(Phase 2)* Audit record emitted
 
 **Alternative Flows**:
 
@@ -1206,7 +1206,8 @@ changes.
 **Postconditions**:
 
 - File content removed from storage backend
-- All associated links invalidated
+- All associated shareable links invalidated; issued signed URLs remain valid until their expiration
+  (`cpt-cf-file-storage-fr-signed-urls`) — the underlying content is no longer available on the backend
 - Metadata and ownership records removed
 - *(Phase 2)* Audit record emitted
 
@@ -1230,24 +1231,27 @@ changes.
 **Main Flow**:
 
 1. Owner requests the list of all active shareable links and signed URLs for a file
-2. FileStorage returns the list with each link's scope, expiration, and creation date
-3. Owner identifies a link to revoke
-4. Owner requests revocation of the link by its identifier
-5. FileStorage invalidates the link immediately
-6. FileStorage emits audit record for the link revocation
+2. FileStorage checks authorization for the owner on `gts.x.fstorage.file`
+3. FileStorage returns the list with each link's scope, expiration, and creation date
+4. Owner identifies a link to revoke
+5. Owner requests revocation of the link by its identifier
+6. FileStorage checks authorization for the owner on `gts.x.fstorage.file`
+7. FileStorage invalidates the link immediately
+8. *(Phase 2)* FileStorage emits audit record for the link revocation
 
 **Postconditions**:
 
 - Revoked link returns access-denied on subsequent access
 - Remaining links unaffected
-- Audit record emitted
+- *(Phase 2)* Audit record emitted
 
 **Alternative Flows**:
 
+- **Authorization denied**: FileStorage returns access-denied error
 - **No active links**: FileStorage returns an empty list
 - **Link not found**: FileStorage returns link_not_found error
 - **Owner creates a new link**: Owner requests a shareable link with desired scope and expiration; FileStorage creates
-  and returns the link URL; audit record emitted for link creation
+  and returns the link URL; *(Phase 2)* audit record emitted for link creation
 
 ### Multi-Backend Deployment
 
@@ -1356,6 +1360,24 @@ changes.
 - [ ] Owner deletion event from EventBroker triggers a configurable Serverless Runtime workflow for file disposition
 - [ ] Files of a deleted owner are retained as orphaned when no workflow is configured
 - [ ] Server-side encryption is applied when the encryption capability is available and enabled for the backend
+- [ ] Upload rejected when storage quota would be exceeded (Quota Enforcement service check)
+- [ ] Usage report emitted asynchronously on every storage-consuming write operation; file operations not blocked if
+  Usage Collector is unavailable
+- [ ] File events emitted to EventBroker on write operations (upload, update, delete) when enabled by owner policy
+- [ ] HTTP Range requests return partial content for large files; seeking and resumable downloads supported
+- [ ] S3-compatible API exposes upload and download operations usable by standard S3 tooling and SDKs
+- [ ] WebDAV API enables native filesystem-like mounting and file access on client operating systems
+- [ ] Retention policies automatically expire and delete files based on configured age, inactivity, or custom metadata
+  criteria; per-file retention overrides are honored
+- [ ] Sharing model restrictions reject link creation for policy-disabled sharing models (public, tenant, hierarchy,
+  signed URLs)
+- [ ] Storage backends can be connected and configured at runtime without service rebuild or redeployment
+- [ ] File ownership transferable by current owner to another user or tenant; transfer requires authorization of both
+  parties and emits an audit record
+- [ ] Custom metadata operations rejected when exceeding configurable limits (max pairs, key length, value length, total
+  size)
+- [ ] Read audit records emitted for proxied downloads and shareable link access when enabled by policy; not emitted for
+  presigned URL downloads
 
 ## 10. Dependencies
 
