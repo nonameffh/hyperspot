@@ -161,10 +161,16 @@ download files directly.
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-delete-file`
 
-The system **MUST** allow the file owner to permanently delete a file and all its associated shareable links.
+The system **MUST** allow the file owner to delete a file. For non-versioned files, deletion is permanent — content,
+metadata, ownership records, and all associated shareable links are removed. When versioning is enabled
+(`cpt-cf-file-storage-fr-file-versioning`), deletion without a version identifier places a soft-delete marker;
+shareable links remain associated but resolve to the soft-deleted state. Permanent removal of a specific version
+requires passing its version identifier explicitly.
 
-**Rationale**: Owners need to remove files that are no longer needed; deletion must cascade to all links to prevent
-dangling references.  
+**Rationale**: Owners need to remove files that are no longer needed; permanent deletion must cascade to all links to
+prevent dangling references. Versioned files default to soft-delete to enable recovery from accidental deletions —
+shareable links are preserved so they can be restored alongside the file. Permanent removal is an explicit,
+version-targeted operation.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
 
 #### Get File Metadata
@@ -228,8 +234,9 @@ the system **MUST** reject the upload with an error indicating the mismatch.
 
 For proxied multipart uploads (`cpt-cf-file-storage-fr-multipart-upload`), the system **MUST** validate the declared
 mime_type against the content of the **first uploaded part**, which contains the file's magic bytes / file signature.
-Validation **MUST** occur when the first part is received — before subsequent parts are accepted. If the first part does
-not match the declared type, the system **MUST** abort the multipart upload and reject all subsequent parts.
+Validation **MUST** occur when the first part is received — before subsequent parts are accepted. If the detected type
+does not match the declared mime_type, the system **MUST** abort the multipart upload (`abortMultipartUpload`) and
+reject all subsequent parts.
 
 Content-type validation does not apply to direct uploads (single-part or multipart) via presigned URLs because
 FileStorage does not receive the file content in that flow.
@@ -237,10 +244,12 @@ FileStorage does not receive the file content in that flow.
 **Rationale**: Without content inspection, a client can declare `image/png` but upload an executable, trivially
 bypassing file type policies. Content-type validation ensures declared types are trustworthy for downstream consumers
 and policy enforcement. First-part validation for multipart uploads provides the same level of guarantee as single-part
-validation — magic bytes reside at the start of the file and are contained in the first part. Post-assembly
-re-validation would require downloading the assembled file from the backend, negating the efficiency benefits of
-multipart upload. Direct uploads trade server-side content validation for transfer efficiency — consumers relying on
-strict type guarantees should use proxied uploads.  
+validation — magic bytes reside at the start of the file and are always contained in the first part because backends
+that support multipart upload (`cpt-cf-file-storage-fr-backend-capabilities`) enforce a minimum part size (e.g., 5 MB
+for S3) that far exceeds the longest magic-byte sequence (~12 bytes). Backends without native multipart support reject
+multipart uploads entirely, so no fallback is needed. Post-assembly re-validation would require downloading the
+assembled file from the backend, negating the efficiency benefits of multipart upload. Direct uploads trade server-side
+content validation for transfer efficiency — consumers relying on strict type guarantees should use proxied uploads.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
 
 ### 5.2 Ownership & Access Control
@@ -1020,7 +1029,8 @@ changes.
 - [ ] `p2` - **ID**: `cpt-cf-file-storage-contract-usage-collector`
 
 **Direction**: required from external service (Usage Collector)
-**Protocol/Format**: Asynchronous usage reports (per-tenant storage consumption)
+**Protocol/Format**: Asynchronous per-owner usage reports (storage consumption per owner, including ownership-transfer
+debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 **Compatibility**: Contract follows platform usage reporting protocol; changes require coordinated release.
 
 #### Quota Enforcement Contract
@@ -1028,7 +1038,8 @@ changes.
 - [ ] `p2` - **ID**: `cpt-cf-file-storage-contract-quota-enforcement`
 
 **Direction**: required from external service (Quota Enforcement)
-**Protocol/Format**: Synchronous quota check requests before storage-consuming operations
+**Protocol/Format**: Synchronous per-owner quota check requests before storage-consuming operations
+(per `cpt-cf-file-storage-fr-storage-quota`)
 **Compatibility**: Contract follows platform quota enforcement protocol; changes require coordinated release.
 
 #### EventBroker Contract
@@ -1228,7 +1239,7 @@ changes.
 - User is authenticated
 - User owns the file
 
-**Main Flow**:
+**Main Flow** (non-versioned file):
 
 1. Owner requests deletion of a file by its identifier
 2. FileStorage checks authorization for delete on `gts.x.fstorage.file.type.v1~`
@@ -1245,10 +1256,40 @@ changes.
 - Metadata and ownership records removed
 - *(Phase 2)* Audit record emitted
 
-**Alternative Flows**:
+**Alternative Flow — versioned file, no version identifier** (`cpt-cf-file-storage-fr-file-versioning`):
+
+1. Owner requests deletion of a file by its identifier (no version identifier supplied)
+2. FileStorage checks authorization for delete on `gts.x.fstorage.file.type.v1~`
+3. FileStorage places a soft-delete marker on the current version
+4. *(Phase 2)* FileStorage emits audit record for the soft-delete
+
+**Postconditions**:
+
+- Current version inaccessible through normal file access; non-current versions remain retrievable by version ID
+- Shareable links remain associated but resolve to the soft-deleted state
+- Content is **not** physically removed and continues to count against storage quota
+  (`cpt-cf-file-storage-fr-storage-quota`)
+- *(Phase 2)* Audit record emitted
+
+**Alternative Flow — versioned file, with version identifier**:
+
+1. Owner requests deletion of a specific version by file identifier and version identifier
+2. FileStorage checks authorization for delete on `gts.x.fstorage.file.type.v1~`
+3. FileStorage permanently removes the specified version from the storage backend
+4. *(Phase 2)* FileStorage emits audit record for the permanent version deletion
+
+**Postconditions**:
+
+- Specified version permanently removed; remaining versions unaffected
+- If the deleted version was the last remaining version, the file is fully removed (equivalent to non-versioned
+  deletion postconditions)
+- *(Phase 2)* Audit record emitted
+
+**Alternative Flows — error cases**:
 
 - **Authorization denied**: FileStorage returns access-denied error
 - **File not found**: FileStorage returns file_not_found error
+- **Version not found**: FileStorage returns version_not_found error
 - **Cross-tenant attempt**: FileStorage returns access-denied error (tenant boundary enforcement)
 
 ### Manage Shareable Links
@@ -1346,7 +1387,8 @@ changes.
 
 - [ ] File upload returns persistent URL and stores metadata (name, size, type, dates, owner)
 - [ ] File download returns content with correct metadata
-- [ ] File deletion cascades to all associated shareable links
+- [ ] File deletion of a non-versioned file permanently removes content and cascades to all associated shareable links
+- [ ] File deletion of a versioned file without version identifier places a soft-delete marker (no physical removal)
 - [ ] Authorization checked for every file operation via Authorization Service
 - [ ] Tenant boundary enforced — cross-tenant modification/deletion rejected
 - [ ] Shareable links work with public, tenant, and tenant-hierarchy scopes
@@ -1395,12 +1437,15 @@ changes.
 - [ ] Conditional download with If-None-Match returns 304 Not Modified when file is unchanged
 - [ ] Metadata update with If-Match returns 412 Precondition Failed when file state has changed
 - [ ] Retried upload with the same idempotency key returns the original result without creating a duplicate file
+- [ ] Retried upload with the same idempotency key by a different owner does not return or create the original owner's
+  file
 - [ ] Owner deletion event from EventBroker triggers a configurable Serverless Runtime workflow for file disposition
 - [ ] Files of a deleted owner are retained as orphaned when no workflow is configured
 - [ ] Server-side encryption is applied when the encryption capability is available and enabled for the backend
 - [ ] Upload rejected when storage quota would be exceeded (Quota Enforcement service check)
 - [ ] Usage report emitted asynchronously on every storage-consuming write operation; file operations not blocked if
   Usage Collector is unavailable
+- [ ] Ownership transfer emits usage reports for both previous and new owner
 - [ ] File events emitted to EventBroker on write operations (upload, update, delete) when enabled by owner policy
 - [ ] HTTP Range requests return partial content for large files; seeking and resumable downloads supported
 - [ ] S3-compatible API exposes upload and download operations usable by standard S3 tooling and SDKs
@@ -1425,7 +1470,7 @@ changes.
 | Authorization Service | Access decisions for `gts.x.fstorage.file.type.v1~` resources     | p1          |
 | Audit Infrastructure  | Platform audit event sink                                          | p2          |
 | Usage Collector       | Receives storage usage reports for metering and billing            | p2          |
-| Quota Enforcement     | Per-tenant storage quota enforcement                               | p2          |
+| Quota Enforcement     | Per-owner storage quota enforcement                                | p2          |
 | EventBroker           | Publishes and consumes file/platform events                        | p2          |
 | Serverless Runtime    | Executes configurable workflows for lifecycle operations           | p2          |
 
