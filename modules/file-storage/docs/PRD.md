@@ -253,7 +253,7 @@ model and prevents accidental privilege escalation.
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-authorization`
 
 The system **MUST** verify authorization for every file operation by requesting an access decision from the
-Authorization Service. Read, write, and delete operations **MUST** be checked against `gts.x.fstorage.file` resources in
+Authorization Service. Read, write, and delete operations **MUST** be checked against `gts.x.fstorage.file.type.v1~` resources in
 the context of the requesting user. Authorization requests **MUST** include the file's GTS type
 (`cpt-cf-file-storage-fr-file-type-classification`) in the resource context to enable per-type access decisions.
 
@@ -978,7 +978,7 @@ changes.
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-contract-authz`
 
 **Direction**: required from external service (Authorization Service)  
-**Protocol/Format**: Access decision requests for `gts.x.fstorage.file` resources  
+**Protocol/Format**: Access decision requests for `gts.x.fstorage.file.type.v1~` resources  
 **Compatibility**: Contract follows platform authorization protocol; changes require coordinated release.
 
 #### Usage Collector Contract
@@ -1030,7 +1030,7 @@ changes.
 
 1. User uploads file content with metadata (name, mime_type, GTS file type)
 2. FileStorage validates the GTS file type format
-3. FileStorage checks authorization for write on `gts.x.fstorage.file` with the file type in resource context
+3. FileStorage checks authorization for write on `gts.x.fstorage.file.type.v1~` with the file type in resource context
 4. *(Phase 2)* FileStorage validates file against policies (type, size); in phase 1 all uploads are accepted
 5. FileStorage persists content, assigns ownership to the user, and stores metadata (including GTS file type)
 6. *(Phase 2)* FileStorage emits audit record for the upload
@@ -1063,7 +1063,7 @@ changes.
 **Main Flow**:
 
 1. Module calls download with a file URL
-2. FileStorage checks authorization for read on `gts.x.fstorage.file` with the file's GTS type in resource context
+2. FileStorage checks authorization for read on `gts.x.fstorage.file.type.v1~` with the file's GTS type in resource context
 3. FileStorage retrieves file content from the storage backend
 4. FileStorage returns content with metadata (mime_type, size, GTS file type)
 
@@ -1091,7 +1091,7 @@ changes.
 **Main Flow**:
 
 1. Owner requests a signed URL for a file with a specified expiration
-2. FileStorage checks authorization for the owner on `gts.x.fstorage.file`
+2. FileStorage checks authorization for the owner on `gts.x.fstorage.file.type.v1~`
 3. *(Phase 2)* FileStorage validates sharing policy allows signed URLs; in phase 1 all sharing models are
    permitted
 4. FileStorage generates a presigned download URL using its own backend credentials, scoped to the file and time-limited
@@ -1128,7 +1128,7 @@ changes.
 **Main Flow**:
 
 1. Module calls get_metadata with a file URL
-2. FileStorage checks authorization for read on `gts.x.fstorage.file` with the file's GTS type in resource context
+2. FileStorage checks authorization for read on `gts.x.fstorage.file.type.v1~` with the file's GTS type in resource context
 3. FileStorage returns metadata (name, size, mime_type, GTS file type, owner, availability) without transferring content
 
 **Postconditions**:
@@ -1156,7 +1156,7 @@ changes.
 1. Client requests a direct transfer URL for upload from FileStorage, providing file metadata (name, mime_type, size,
    GTS file type)
 2. FileStorage validates the GTS file type format
-3. FileStorage checks authorization for write on `gts.x.fstorage.file` with the file type in resource context
+3. FileStorage checks authorization for write on `gts.x.fstorage.file.type.v1~` with the file type in resource context
 4. *(Phase 2)* FileStorage validates file against policies (type, size); in phase 1 all uploads are accepted
 5. FileStorage registers the file metadata (including GTS file type) and ownership, assigns the target backend path
 6. FileStorage generates a presigned upload URL using its own backend credentials (e.g., AWS access key), scoped to the
@@ -1197,7 +1197,7 @@ changes.
 **Main Flow**:
 
 1. Owner requests deletion of a file by its identifier
-2. FileStorage checks authorization for delete on `gts.x.fstorage.file`
+2. FileStorage checks authorization for delete on `gts.x.fstorage.file.type.v1~`
 3. FileStorage revokes all active shareable links associated with the file
 4. FileStorage deletes the file content from the storage backend
 5. FileStorage removes file metadata and ownership records
@@ -1231,11 +1231,11 @@ changes.
 **Main Flow**:
 
 1. Owner requests the list of all active shareable links and signed URLs for a file
-2. FileStorage checks authorization for the owner on `gts.x.fstorage.file`
+2. FileStorage checks authorization for the owner on `gts.x.fstorage.file.type.v1~`
 3. FileStorage returns the list with each link's scope, expiration, and creation date
 4. Owner identifies a link to revoke
 5. Owner requests revocation of the link by its identifier
-6. FileStorage checks authorization for the owner on `gts.x.fstorage.file`
+6. FileStorage checks authorization for the owner on `gts.x.fstorage.file.type.v1~`
 7. FileStorage invalidates the link immediately
 8. *(Phase 2)* FileStorage emits audit record for the link revocation
 
@@ -1381,19 +1381,19 @@ changes.
 
 ## 10. Dependencies
 
-| Dependency            | Description                                              | Criticality |
-|-----------------------|----------------------------------------------------------|-------------|
-| ModKit Framework      | Module lifecycle, ClientHub for service registration     | p1          |
-| Authorization Service | Access decisions for `gts.x.fstorage.file` resources     | p1          |
-| Audit Infrastructure  | Platform audit event sink                                | p2          |
-| Usage Collector       | Receives storage usage reports for metering and billing  | p2          |
-| Quota Enforcement     | Per-tenant storage quota enforcement                     | p2          |
-| EventBroker           | Publishes and consumes file/platform events              | p2          |
-| Serverless Runtime    | Executes configurable workflows for lifecycle operations | p2          |
+| Dependency            | Description                                                        | Criticality |
+|-----------------------|--------------------------------------------------------------------|-------------|
+| ModKit Framework      | Module lifecycle, ClientHub for service registration               | p1          |
+| Authorization Service | Access decisions for `gts.x.fstorage.file.type.v1~` resources     | p1          |
+| Audit Infrastructure  | Platform audit event sink                                          | p2          |
+| Usage Collector       | Receives storage usage reports for metering and billing            | p2          |
+| Quota Enforcement     | Per-tenant storage quota enforcement                               | p2          |
+| EventBroker           | Publishes and consumes file/platform events                        | p2          |
+| Serverless Runtime    | Executes configurable workflows for lifecycle operations           | p2          |
 
 ## 11. Assumptions
 
-- Authorization Service is available and supports `gts.x.fstorage.file` resource type
+- Authorization Service is available and supports `gts.x.fstorage.file.type.v1~` resource type
 - All file access respects tenant boundaries at the platform level
 - Initial storage backend is configured at deployment time; runtime backend switching is phase 2
 - File URLs are internal to CyberFabric; external access is via shareable links or signed URLs
