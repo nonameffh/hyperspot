@@ -361,7 +361,9 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
             .await?;
         Ok((
             effective,
-            route.expect("route always present when method+path provided"),
+            route.ok_or_else(|| DomainError::Internal {
+                message: "resolve_alias returned None route for method+path request".into(),
+            })?,
         ))
     }
 }
@@ -536,8 +538,10 @@ impl ControlPlaneServiceImpl {
         if merge_chain.is_empty() {
             // Single upstream → apply route overrides directly if present.
             if let Some(ref route) = route {
-                let effective =
-                    compute_effective_config(std::slice::from_ref(&selected_upstream), Some(route));
+                let effective = compute_effective_config(
+                    std::slice::from_ref(&selected_upstream),
+                    Some(route),
+                )?;
                 return Ok((effective, Some(route.clone())));
             }
             return Ok((selected_upstream, None));
@@ -547,7 +551,7 @@ impl ControlPlaneServiceImpl {
         let mut merge_vec: Vec<Upstream> = merge_chain.into_iter().rev().cloned().collect();
         merge_vec.push(selected_upstream);
 
-        let effective = compute_effective_config(&merge_vec, route.as_ref());
+        let effective = compute_effective_config(&merge_vec, route.as_ref())?;
         Ok((effective, route))
     }
 
@@ -1138,13 +1142,14 @@ fn is_visible_to_descendant(upstream: &Upstream) -> bool {
 pub(crate) fn compute_effective_config(
     ancestor_chain: &[Upstream],
     route: Option<&Route>,
-) -> Upstream {
+) -> Result<Upstream, DomainError> {
     use crate::domain::model::SharingMode;
 
-    assert!(
-        !ancestor_chain.is_empty(),
-        "ancestor_chain must not be empty"
-    );
+    if ancestor_chain.is_empty() {
+        return Err(DomainError::Internal {
+            message: "compute_effective_config called with empty ancestor_chain".into(),
+        });
+    }
 
     // Start with the root upstream as the base.
     let mut effective = ancestor_chain[0].clone();
@@ -1221,7 +1226,7 @@ pub(crate) fn compute_effective_config(
         }
     }
 
-    effective
+    Ok(effective)
 }
 
 /// Merge auth config from a descendant layer onto the effective config.
@@ -2364,7 +2369,7 @@ mod tests {
     fn effective_config_single_upstream() {
         let t = Uuid::new_v4();
         let u = make_upstream(t, "openai", None, None, None, vec!["a".into()]);
-        let effective = compute_effective_config(std::slice::from_ref(&u), None);
+        let effective = compute_effective_config(std::slice::from_ref(&u), None).unwrap();
         assert_eq!(effective.id, u.id);
         assert_eq!(effective.tags, vec!["a".to_string()]);
     }
@@ -2395,7 +2400,7 @@ mod tests {
             vec![],
         );
 
-        let effective = compute_effective_config(&[root, child], None);
+        let effective = compute_effective_config(&[root, child], None).unwrap();
         assert_eq!(effective.auth.unwrap().plugin_type, "oauth2");
     }
 
@@ -2418,7 +2423,7 @@ mod tests {
         let root = make_upstream(root_id, "openai", Some(root_auth), None, None, vec![]);
         let child = make_upstream(child_id, "openai", Some(child_auth), None, None, vec![]);
 
-        let effective = compute_effective_config(&[root, child], None);
+        let effective = compute_effective_config(&[root, child], None).unwrap();
         // Ancestor enforce wins — apikey stays.
         assert_eq!(effective.auth.unwrap().plugin_type, "apikey");
     }
@@ -2434,7 +2439,7 @@ mod tests {
         let root = make_upstream(root_id, "openai", None, Some(root_rl), None, vec![]);
         let child = make_upstream(child_id, "openai", None, Some(child_rl), None, vec![]);
 
-        let effective = compute_effective_config(&[root, child], None);
+        let effective = compute_effective_config(&[root, child], None).unwrap();
         // min(100/min, 200/min) = 100/min
         assert_eq!(effective.rate_limit.unwrap().sustained.rate, 100);
     }
@@ -2450,7 +2455,7 @@ mod tests {
         let root = make_upstream(root_id, "openai", None, Some(root_rl), None, vec![]);
         let child = make_upstream(child_id, "openai", None, Some(child_rl), None, vec![]);
 
-        let effective = compute_effective_config(&[root, child], None);
+        let effective = compute_effective_config(&[root, child], None).unwrap();
         assert_eq!(effective.rate_limit.unwrap().sustained.rate, 50);
     }
 
@@ -2471,7 +2476,7 @@ mod tests {
         let root = make_upstream(root_id, "openai", None, None, Some(root_plugins), vec![]);
         let child = make_upstream(child_id, "openai", None, None, Some(child_plugins), vec![]);
 
-        let effective = compute_effective_config(&[root, child], None);
+        let effective = compute_effective_config(&[root, child], None).unwrap();
         let items = effective.plugins.unwrap().items;
         // ancestor + descendant (dedup): [a, b, c]
         assert_eq!(items, vec!["plugin-a", "plugin-b", "plugin-c"]);
@@ -2494,7 +2499,7 @@ mod tests {
         let root = make_upstream(root_id, "openai", None, None, Some(root_plugins), vec![]);
         let child = make_upstream(child_id, "openai", None, None, Some(child_plugins), vec![]);
 
-        let effective = compute_effective_config(&[root, child], None);
+        let effective = compute_effective_config(&[root, child], None).unwrap();
         let items = effective.plugins.unwrap().items;
         // Enforced plugins remain: required-plugin + extra-plugin.
         assert!(items.contains(&"required-plugin".to_string()));
@@ -2523,7 +2528,7 @@ mod tests {
             vec!["team:platform".into(), "region:us".into()],
         );
 
-        let effective = compute_effective_config(&[root, child], None);
+        let effective = compute_effective_config(&[root, child], None).unwrap();
         assert!(effective.tags.contains(&"env:prod".to_string()));
         assert!(effective.tags.contains(&"team:platform".to_string()));
         assert!(effective.tags.contains(&"region:us".to_string()));
@@ -2551,7 +2556,7 @@ mod tests {
             enabled: true,
         };
 
-        let effective = compute_effective_config(&[u], Some(&route));
+        let effective = compute_effective_config(&[u], Some(&route)).unwrap();
         // min(100/min, 50/min) = 50/min
         assert_eq!(effective.rate_limit.unwrap().sustained.rate, 50);
     }
@@ -2605,7 +2610,7 @@ mod tests {
         );
 
         let child_id_val = child.id;
-        let effective = compute_effective_config(&[root, parent, child], None);
+        let effective = compute_effective_config(&[root, parent, child], None).unwrap();
 
         // Auth: root enforced → apikey wins even though parent set oauth2.
         assert_eq!(effective.auth.unwrap().plugin_type, "apikey");
@@ -3165,7 +3170,7 @@ mod tests {
         let root = make_upstream(root_id, "openai", Some(root_auth), None, None, vec![]);
         let child = make_upstream(child_id, "openai", Some(child_auth), None, None, vec![]);
 
-        let effective = compute_effective_config(&[root, child], None);
+        let effective = compute_effective_config(&[root, child], None).unwrap();
         // Ancestor is Inherit (not Enforce) — Private descendant replaces.
         let auth = effective.auth.unwrap();
         assert_eq!(auth.plugin_type, "oauth2");
@@ -3199,7 +3204,7 @@ mod tests {
             enabled: true,
         };
 
-        let effective = compute_effective_config(&[u], Some(&route));
+        let effective = compute_effective_config(&[u], Some(&route)).unwrap();
         let items = effective.plugins.unwrap().items;
         // Route plugins with Private sharing are skipped — only upstream plugins remain.
         assert_eq!(items, vec!["upstream-plugin".to_string()]);
@@ -3226,7 +3231,7 @@ mod tests {
             enabled: true,
         };
 
-        let effective = compute_effective_config(&[u], Some(&route));
+        let effective = compute_effective_config(&[u], Some(&route)).unwrap();
         // Route rate_limit with Private sharing is skipped — upstream rate stays.
         assert_eq!(effective.rate_limit.unwrap().sustained.rate, 100);
     }
@@ -3244,7 +3249,7 @@ mod tests {
         let root = make_upstream(root_id, "openai", None, Some(root_rl), None, vec![]);
         let child = make_upstream(child_id, "openai", None, Some(child_rl), None, vec![]);
 
-        let effective = compute_effective_config(&[root, child], None);
+        let effective = compute_effective_config(&[root, child], None).unwrap();
         // Enforced ancestor rate (100/min) must still constrain even though
         // descendant declared Private with a much higher rate.
         assert_eq!(effective.rate_limit.unwrap().sustained.rate, 100);
@@ -3269,7 +3274,7 @@ mod tests {
         let root = make_upstream(root_id, "openai", Some(root_auth), None, None, vec![]);
         let child = make_upstream(child_id, "openai", Some(child_auth), None, None, vec![]);
 
-        let effective = compute_effective_config(&[root, child], None);
+        let effective = compute_effective_config(&[root, child], None).unwrap();
         // Enforced ancestor auth (apikey) must survive even though
         // descendant declared Private with oauth2.
         assert_eq!(effective.auth.unwrap().plugin_type, "apikey");
@@ -3292,7 +3297,7 @@ mod tests {
         let root = make_upstream(root_id, "openai", None, None, Some(root_plugins), vec![]);
         let child = make_upstream(child_id, "openai", None, None, Some(child_plugins), vec![]);
 
-        let effective = compute_effective_config(&[root, child], None);
+        let effective = compute_effective_config(&[root, child], None).unwrap();
         let items = effective.plugins.unwrap().items;
         // Enforced "audit-log" must survive even though descendant set Private.
         assert!(items.contains(&"audit-log".to_string()));
