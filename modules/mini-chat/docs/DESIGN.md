@@ -1688,35 +1688,90 @@ sequenceDiagram
     end
 ```
 
-**Description**: Chat deletion is a two-phase operation: synchronous soft-delete (immediate 204 response) followed by asynchronous cleanup of external provider resources (files, vector stores). The cleanup worker runs as a periodic background task.
+**Description**: Chat deletion is a two-phase operation: synchronous soft-delete (immediate 204 response) followed by asynchronous cleanup of external provider resources. The cleanup worker is responsible for removing external provider resources associated with soft-deleted chats. These resources include provider files and provider vector stores. Cleanup is performed asynchronously and is idempotent. The worker scans for attachments belonging to soft-deleted chats whose cleanup state is not terminal and performs provider deletion through OAGW.
 
-**Cleanup lifecycle invariants (normative)**:
+##### Cleanup responsibility boundaries
+
+There are two distinct cleanup paths in the system:
+
+1. Attachment deletion via API uses the transactional outbox mechanism.
+2. Chat deletion cleanup uses the cleanup worker.
+
+Normative rules:
+
+- Attachment deletion (`DELETE /v1/chats/{chat_id}/attachments/{attachment_id}`) MUST use the transactional outbox mechanism to trigger provider deletion.
+- Chat deletion cleanup MUST be performed by the cleanup worker.
+- The cleanup worker MAY also act as a fallback mechanism for attachments that remain after failed outbox cleanup attempts.
+- The two mechanisms MUST NOT both attempt cleanup for the same attachment simultaneously.
+
+##### Attachment cleanup state machine
+
+`attachments.cleanup_status` uses the following worker state machine:
+
+- `pending` — eligible for claim
+- `in_progress` — currently claimed by a cleanup worker
+- `done` — provider cleanup finished successfully
+- `failed` — cleanup permanently failed after exhausting retries
+
+Allowed transitions:
+
+- `pending` -> `in_progress`
+- `in_progress` -> `done`
+- `in_progress` -> `pending` (retryable failure)
+- `in_progress` -> `failed` (after `cleanup_worker.max_attempts`)
+
+Normative rules:
+
+- `done` and `failed` are terminal states.
+- The cleanup worker MUST NOT reclaim rows in terminal states.
+- Retry backoff MUST be applied between attempts.
+- On retryable failure, the worker MUST increment `attachments.cleanup_attempts`, record `last_cleanup_error`, and reset `cleanup_status` to `pending`.
+
+##### Row claiming semantics
+
+- The cleanup worker MUST process only attachments belonging to chats where `chats.deleted_at IS NOT NULL`.
+- Active chats (`chats.deleted_at IS NULL`) MUST NOT be processed by the cleanup worker.
+- Multiple cleanup worker instances MAY run concurrently without leader election.
+- The worker MUST claim candidate rows using `SELECT ... FOR UPDATE SKIP LOCKED` (or equivalent).
+- Candidate selection MUST filter `attachments.cleanup_status = 'pending'` and `chats.deleted_at IS NOT NULL`.
+- Claim order SHOULD be `ORDER BY chats.deleted_at ASC`.
+- Each claim cycle MUST use `LIMIT cleanup_worker.batch_size`.
+
+##### Vector store cleanup ordering
+
+Each chat has at most one vector store (created on first document upload). The `vector_store_id` is an opaque provider-assigned identifier stored in the `chat_vector_stores` table.
+
+Normative rules:
+
+- A chat vector store MUST be deleted only after all attachments belonging to the chat have reached a terminal cleanup state.
+- The worker MUST first clean up attachments, then check for any remaining non-terminal attachment cleanup rows for the chat, and delete the vector store only if none remain.
+- Provider `404 Not Found` responses for file deletion and vector store deletion MUST be treated as success.
+- After successful vector store deletion, the `chat_vector_stores` row MUST be deleted.
+
+##### Additional invariants
 
 1. **Idempotency**: every cleanup step MUST be idempotent. Provider `DELETE` calls that return `404 Not Found` (resource already deleted) MUST be treated as success, not failure. The cleanup worker MUST NOT fail or retry on `404` responses from the provider.
 
-2. **Retry with bounded backoff**: if a cleanup step fails (provider error, timeout, network failure), the worker MUST increment `attachments.cleanup_attempts`, record the error in `last_cleanup_error`, and reset `cleanup_status` back to `'pending'` for retry on the next cycle. Retry backoff: the worker SHOULD skip attachments where `cleanup_attempts >= max_cleanup_attempts` (default: 10, configurable) and mark them as `cleanup_status = 'failed'`. Failed cleanups are surfaced via the `mini_chat_cleanup_failed_total` metric for operational alerting.
+2. **No identifier reuse**: `vector_store_id` and `provider_file_id` are provider-assigned opaque identifiers. Mini Chat MUST NOT assume or rely on any reuse semantics — each provider resource has a unique lifecycle. Since chat IDs are UUIDs, the scenario of "chat recreated with the same ID" does not occur in practice; soft-deleted chat rows are retained for audit and are excluded from active queries by `deleted_at IS NOT NULL`.
 
-3. **Vector store lifecycle**: each chat has at most one vector store (created on first document upload). The `vector_store_id` is an opaque provider-assigned identifier stored in the `chat_vector_stores` table. Vector store cleanup MUST occur after all file deletions for that chat are complete (or have reached terminal `'done'`/`'failed'` status) to avoid provider errors from deleting a vector store that still references files. After successful vector store deletion, the `chat_vector_stores` row MUST be deleted.
-
-4. **No identifier reuse**: `vector_store_id` and `provider_file_id` are provider-assigned opaque identifiers. Mini Chat MUST NOT assume or rely on any reuse semantics — each provider resource has a unique lifecycle. Since chat IDs are UUIDs, the scenario of "chat recreated with the same ID" does not occur in practice; soft-deleted chat rows are retained for audit and are excluded from active queries by `deleted_at IS NOT NULL`.
-
-5. **Concurrency safety**: the cleanup worker MUST use `SELECT ... FOR UPDATE SKIP LOCKED` (or equivalent) when claiming attachments for cleanup, to prevent duplicate cleanup attempts across multiple worker instances. Leader election is NOT required for the cleanup worker — `SKIP LOCKED` provides distributed-safe work claiming.
-
-6. **Orphan resource tolerance**: if the cleanup worker is unavailable (deployment issue, leader election gap), provider resources remain allocated but are not accessible to users (the chat is soft-deleted). This is operationally acceptable — the resources are cleaned up when the worker resumes. The `mini_chat_cleanup_pending_total` gauge metric tracks the backlog.
+3. **Failure tolerance**: if the cleanup worker is unavailable because of worker downtime, provider errors, database outages, or service restarts, provider resources remain allocated but are not accessible to users (the chat is soft-deleted). This is operationally acceptable — the resources are cleaned up when the worker resumes. The `mini_chat_cleanup_pending` gauge metric tracks the backlog.
 
 **Cleanup configuration knobs** (deployment config):
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `cleanup_poll_interval_seconds` | integer | 60 | Cleanup worker poll interval |
-| `max_cleanup_attempts` | integer | 10 | Max retry attempts per attachment before marking as `failed` |
-| `cleanup_batch_size` | integer | 50 | Max attachments claimed per poll cycle |
+| `cleanup_worker.enabled` | bool | true | Enables the cleanup worker |
+| `cleanup_worker.poll_interval_secs` | integer | 60 | Cleanup worker poll interval |
+| `cleanup_worker.batch_size` | integer | 32 | Max attachments claimed per poll cycle |
+| `cleanup_worker.max_attempts` | integer | 5 | Max retry attempts per attachment before marking as `failed` |
 
 **Observability (P1)**:
 
-- `mini_chat_cleanup_pending_total` (gauge) — attachments with `cleanup_status = 'pending'`
-- `mini_chat_cleanup_failed_total` (counter) — attachments that reached `max_cleanup_attempts`
-- `mini_chat_cleanup_completed_total` (counter) — successful cleanup operations
+- `mini_chat_cleanup_completed_total{resource_type="file|vector_store"}` (counter) — successful cleanup operations
+- `mini_chat_cleanup_failed_total{resource_type="file|vector_store"}` (counter) — cleanup operations that transition to terminal `failed`
+- `mini_chat_cleanup_pending` (gauge) — attachments belonging to soft-deleted chats with `cleanup_status = 'pending'`
+
+The `resource_type` label distinguishes file cleanup and vector store cleanup.
 
 ### 3.7 Database Schemas & Tables
 
@@ -3803,7 +3858,7 @@ When a chat is deleted:
 
 P1 operational requirement: run a periodic reconcile job (for example nightly) to reduce provider drift and manual cleanup.
 
-- Re-enqueue attachment cleanup for rows stuck in `cleanup_status=pending|failed` beyond a configured age.
+- Re-enqueue attachment cleanup for rows stuck in `cleanup_status=pending` or for rows in `cleanup_status=in_progress` that have not been updated for longer than a configured timeout (worker crash recovery). Rows in terminal states (`done`, `failed`) are excluded.
 - Emit cleanup drift metrics (`mini_chat_cleanup_orphan_found_total`, `mini_chat_cleanup_orphan_fixed_total`) based on what can be detected from DB state and provider responses.
 
 ## 5. Quota Enforcement and Billing Integration
@@ -6713,13 +6768,23 @@ Orphan cleanup is asynchronous and MUST NOT block any user-visible request path.
 
 ### B.9.2 Cleanup worker
 
-| Parameter | Type | Default | Valid range | Source |
-|-----------|------|---------|-------------|--------|
-| `cleanup_poll_interval_seconds` | `integer` | `60` | `1..=3600` | **ConfigMap** |
-| `max_cleanup_attempts` | `integer` | `10` | `1..=100` | **ConfigMap** |
-| `cleanup_batch_size` | `integer` | `50` | `1..=1000` | **ConfigMap** |
+| Parameter | Type | Default | Source |
+|-----------|------|---------|--------|
+| `cleanup_worker.enabled` | `bool` | `true` | **ConfigMap** |
+| `cleanup_worker.poll_interval_secs` | `integer` | `60` | **ConfigMap** |
+| `cleanup_worker.batch_size` | `integer` | `32` | **ConfigMap** |
+| `cleanup_worker.max_attempts` | `integer` | `5` | **ConfigMap** |
 
-**See also**: `Cleanup on Chat Deletion` for lifecycle invariants, claiming strategy, retry/backoff semantics, and observability.
+The cleanup worker is responsible for removing external provider resources associated with soft-deleted chats.
+
+These resources include:
+
+- provider files
+- provider vector stores
+
+Cleanup is performed asynchronously and is idempotent.
+
+The worker scans for attachments belonging to soft-deleted chats whose cleanup state is not terminal and performs provider deletion through OAGW.
 
 ### B.9.3 Outbox dispatcher
 
