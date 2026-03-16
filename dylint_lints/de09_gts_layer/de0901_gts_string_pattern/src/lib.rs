@@ -73,6 +73,23 @@ impl EarlyLintPass for De0901GtsStringPattern {
             return;
         }
 
+        // Validate the wildcard GTS pattern itself before skip-listing.
+        let result = GtsOps::parse_id(s);
+        if !result.ok {
+            cx.span_lint(DE0901_GTS_STRING_PATTERN, item.span, |diag| {
+                diag.primary_message(format!(
+                    "invalid GTS wildcard pattern in `{item_name}`: '{s}' (DE0901)"
+                ));
+                diag.note(result.error);
+                diag.help("Example: gts.x.core.srr.resource.v1~*");
+            });
+            // Still skip-list so check_expr doesn't double-report the literal.
+            SKIP_SPANS.with(|spans| {
+                collect_nested_spans(init, &mut spans.borrow_mut());
+            });
+            return;
+        }
+
         if !item_name.ends_with("_WILDCARD") {
             cx.span_lint(DE0901_GTS_STRING_PATTERN, item.span, |diag| {
                 diag.primary_message(format!(
@@ -113,10 +130,14 @@ impl EarlyLintPass for De0901GtsStringPattern {
                 || method_name == "with_pattern"
                 || method_name == "resolve_to_uuids"
             {
-                // Add arguments and all nested sub-expression spans to skip list.
-                // This is necessary because arguments like &["gts...".to_owned()]
-                // contain deeply nested string literals whose spans differ from
-                // the top-level argument span.
+                // Validate nested string literals BEFORE skip-listing so that
+                // deeply nested GTS strings (e.g. inside &["gts...".to_owned()])
+                // are checked rather than silently escaping validation.
+                for arg in &method_call.args {
+                    self.validate_nested_gts_strings(cx, arg, true);
+                }
+                // Then add all nested sub-expression spans to the skip list
+                // to prevent duplicate reports from check_expr.
                 SKIP_SPANS.with(|spans| {
                     let mut spans = spans.borrow_mut();
                     for arg in &method_call.args {
@@ -136,9 +157,10 @@ impl EarlyLintPass for De0901GtsStringPattern {
                         collect_nested_spans(arg, &mut spans);
                     }
                 });
-                // Validate args as wildcard-allowed patterns and return early.
+                // Validate args (including nested literals) as wildcard-allowed
+                // patterns and return early.
                 for arg in args {
-                    self.check_gts_string_literal_with_wildcards(cx, arg);
+                    self.validate_nested_gts_strings(cx, arg, true);
                 }
                 return;
             }
@@ -155,15 +177,11 @@ impl EarlyLintPass for De0901GtsStringPattern {
         // Check if this is a method call - handle resource_pattern and with_pattern specially
         if let ExprKind::MethodCall(method_call) = &expr.kind {
             let method_name = method_call.seg.ident.name.as_str();
-            // Check if this is a method call that allows wildcards in its arguments
+            // Already validated in Phase 1 via validate_nested_gts_strings
             if method_name == "resource_pattern"
                 || method_name == "with_pattern"
                 || method_name == "resolve_to_uuids"
             {
-                // Check string literals in these calls with wildcards allowed
-                for arg in &method_call.args {
-                    self.check_gts_string_literal_with_wildcards(cx, arg);
-                }
                 return;
             }
 
@@ -273,6 +291,53 @@ impl De0901GtsStringPattern {
         }
 
         self.validate_instance_id_segment(cx, expr.span, arg_str);
+    }
+
+    /// Recursively traverse an expression tree and validate any GTS string
+    /// literals found within. Mirrors the structure of `collect_nested_spans`
+    /// so that every string literal that would be skip-listed is also validated.
+    fn validate_nested_gts_strings(
+        &self,
+        cx: &EarlyContext<'_>,
+        expr: &Expr,
+        allow_wildcards: bool,
+    ) {
+        // If this is a string literal, validate it directly
+        if Self::string_lit_value(expr).is_some() {
+            self.check_gts_string_literal_with_wildcard_flag(cx, expr, allow_wildcards);
+            return;
+        }
+        // Otherwise, recurse into sub-expressions
+        match &expr.kind {
+            ExprKind::MethodCall(mc) => {
+                self.validate_nested_gts_strings(cx, &mc.receiver, allow_wildcards);
+                for arg in &mc.args {
+                    self.validate_nested_gts_strings(cx, arg, allow_wildcards);
+                }
+            }
+            ExprKind::AddrOf(_, _, inner) => {
+                self.validate_nested_gts_strings(cx, inner, allow_wildcards);
+            }
+            ExprKind::Array(elements) => {
+                for elem in elements {
+                    self.validate_nested_gts_strings(cx, elem, allow_wildcards);
+                }
+            }
+            ExprKind::Call(_, args) => {
+                for arg in args {
+                    self.validate_nested_gts_strings(cx, arg, allow_wildcards);
+                }
+            }
+            ExprKind::Tup(elements) => {
+                for elem in elements {
+                    self.validate_nested_gts_strings(cx, elem, allow_wildcards);
+                }
+            }
+            ExprKind::Paren(inner) => {
+                self.validate_nested_gts_strings(cx, inner, allow_wildcards);
+            }
+            _ => {}
+        }
     }
 
     fn check_gts_string_literal(&self, cx: &EarlyContext<'_>, expr: &Expr) {
