@@ -1,4 +1,4 @@
-// Updated: 2026-03-16 by Constructor Tech
+// Updated: 2026-03-18 by Constructor Tech
 use std::fmt;
 
 use serde::de::Deserializer;
@@ -8,30 +8,8 @@ use zeroize::Zeroize;
 
 use crate::error::CredStoreError;
 
-/// Tenant identifier, matching `tenant-resolver-sdk` convention.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct TenantId(pub Uuid);
-
-impl TenantId {
-    /// Returns the nil UUID wrapped as a `TenantId`.
-    #[must_use]
-    pub fn nil() -> Self {
-        Self(Uuid::nil())
-    }
-
-    /// Returns `true` if the inner UUID is the nil UUID.
-    #[must_use]
-    pub fn is_nil(&self) -> bool {
-        self.0.is_nil()
-    }
-}
-
-impl fmt::Display for TenantId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.0, f)
-    }
-}
+/// Re-export from tenant-resolver-sdk for cross-module type consistency.
+pub use tenant_resolver_sdk::TenantId;
 
 /// Owner identifier, representing `SecurityContext.subject_id()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

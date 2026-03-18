@@ -33,3 +33,6 @@ gts-macros = { workspace = true }
 # ModKit dependencies
 modkit = { workspace = true }
 modkit-security = { workspace = true }
+
+# Domain types owned by tenant-resolver
+tenant-resolver-sdk = { workspace = true }

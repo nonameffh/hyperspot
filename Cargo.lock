@@ -1181,6 +1181,7 @@ dependencies = [
  "async-trait",
  "cf-modkit",
  "cf-modkit-security",
+ "cf-tenant-resolver-sdk",
  "gts",
  "gts-macros",
  "schemars 1.2.1",
