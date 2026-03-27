@@ -33,7 +33,7 @@ The external API follows the [Open Responses](https://www.openresponses.org/) pr
 
 The architecture follows a pass-through design: Gateway normalizes requests and responses but does not interpret content or execute tools. Provider-specific adapters handle translation to/from each provider's native API format into the Open Responses protocol. All external calls route through Outbound API Gateway for credential injection and circuit breaking. Gateway also performs health-based routing using Model Registry metrics — see [ADR-0004](./ADR/0004-cpt-cf-llm-gateway-adr-circuit-breaking.md) for the distinction between infrastructure-level circuit breaking (OAGW) and business-level health routing (Gateway).
 
-The system is horizontally scalable and stateless. No conversation history is stored; consumers provide full context with each request. Server-side response storage (`store`) and conversation continuation (`previous_response_id`) from the Open Responses protocol are not supported — see [ADR-0007](./ADR/0007-cpt-cf-llm-gateway-adr-no-stored-responses.md) for rationale. The only state is temporary async job tracking, which can be stored in distributed cache.
+The system is horizontally scalable and stateless for request processing — no conversation history is stored; consumers provide full context with each request. Server-side response storage (`store`) and conversation continuation (`previous_response_id`) from the Open Responses protocol are not supported — see [ADR-0007](./ADR/0007-cpt-cf-llm-gateway-adr-no-stored-responses.md) for rationale. Gateway does persist operational state in a database: async/batch job records (ID mappings, status, results) retained until their TTL expires. Guaranteed at-least-once delivery of usage records is handled by the Usage Tracker SDK.
 
 ### 1.2 Architecture Drivers
 
@@ -60,7 +60,7 @@ See [PRD.md](./PRD.md) section 1 "Overview" — Key Problems Solved:
 | `cpt-cf-llm-gateway-fr-tool-calling-v1` | Type Registry resolution + format conversion |
 | `cpt-cf-llm-gateway-fr-structured-output-v1` | Schema validation |
 | `cpt-cf-llm-gateway-fr-document-understanding-v1` | FileStorage fetch + provider adapters |
-| `cpt-cf-llm-gateway-fr-async-jobs-v1` | Distributed cache for job state, polling abstraction |
+| `cpt-cf-llm-gateway-fr-async-jobs-v1` | Persistent DB for job state, polling abstraction |
 | `cpt-cf-llm-gateway-fr-realtime-audio-v1` | WebSocket proxy via Outbound API GW |
 | `cpt-cf-llm-gateway-fr-usage-tracking-v1` | AI credit reporting via Usage Tracker (tokens→credits conversion using Model Registry prices) |
 | `cpt-cf-llm-gateway-fr-provider-fallback-v1` | Fallback chain from request config |
@@ -76,9 +76,9 @@ See [PRD.md](./PRD.md) section 1 "Overview" — Key Problems Solved:
 
 | Cypilot ID | Solution short description |
 |--------|----------------------------|
-| `cpt-cf-llm-gateway-nfr-scalability-v1` | Stateless design, distributed cache for async jobs |
-| `cpt-cf-llm-gateway-nfr-data-retention-v1` | TTL-based cleanup, background purge task for expired job records and outbox entries |
-| `cpt-cf-llm-gateway-nfr-recovery-v1` | Persistent storage for job state, infrastructure-level HA |
+| `cpt-cf-llm-gateway-nfr-scalability-v1` | Stateless request processing, shared DB for async jobs |
+| `cpt-cf-llm-gateway-nfr-data-retention-v1` | TTL-based cleanup, background purge task for expired job records |
+| `cpt-cf-llm-gateway-nfr-recovery-v1` | Native async jobs: persistent DB survives restarts (RPO: 0). Simulated async jobs: not recovered on outage — marked failed to prevent unauthorized token spending |
 | `cpt-cf-llm-gateway-nfr-compatibility-v1` | API backward compatibility within major version, SDK-only inter-module communication |
 
 #### Key ADRs
@@ -100,7 +100,7 @@ See [PRD.md](./PRD.md) section 1 "Overview" — Key Problems Solved:
 | API | Request/response handling, validation | REST/OpenAPI |
 | Application | Request orchestration, provider routing | Core services |
 | Adapters | Provider-specific translation | Provider adapters |
-| Infrastructure | External calls, caching | Outbound API GW, distributed cache |
+| Infrastructure | External calls, persistence | Outbound API GW, SeaORM/SecureConn |
 
 ## 2. Principles & Constraints
 
@@ -112,7 +112,7 @@ See [PRD.md](./PRD.md) section 1 "Overview" — Key Problems Solved:
 
 **ADRs**: `cpt-cf-llm-gateway-adr-stateless`, `cpt-cf-llm-gateway-adr-no-stored-responses`
 
-Gateway does not store conversation history. Consumer provides full context with each request. Open Responses `store` parameter is forced to `false`; `previous_response_id` is not supported. Exception: temporary async job state.
+Gateway does not store conversation history. Consumer provides full context with each request. Open Responses `store` parameter is forced to `false`; `previous_response_id` is not supported. Gateway does persist operational state: async/batch job records (retained until TTL expires). Guaranteed at-least-once delivery of usage records is handled by the Usage Tracker SDK.
 
 #### Pass-through
 
@@ -245,11 +245,10 @@ Tool control:
 
 *Async (`async/`):*
 
-Not part of the Open Responses specification. Gateway-specific endpoints for long-running operations.
+Not part of the Open Responses specification. Gateway-specific entities for long-running operations. Persisted in database (see section 3.5).
 
-- Job — Async job (id, status, request, result, error, created_at, expires_at)
-- Batch — Batch request (id, status, requests[], created_at)
-- BatchRequest — Individual batch item (custom_id, request, result, error)
+- Job — Async job (id, tenant_id, provider_job_id, status, request, result, error, created_at, completed_at, expires_at)
+- Batch — Batch request (id, tenant_id, status, input_file_url: FileStorage URL from consumer, results_file_url: FileStorage URL generated by Gateway, created_at, expires_at)
 - JobStatus — Enum: pending, running, completed, failed, cancelled
 - BatchStatus — Enum: pending, in_progress, completed, failed, cancelled
 
@@ -279,7 +278,6 @@ Not part of the Open Responses specification. Gateway-specific endpoints for lon
 - Job → ResponseResource: optional result
 - Job → Error: optional
 - Batch → BatchStatus: has
-- Batch → BatchRequest: contains 1..*
 
 ### 3.2 Component Model
 
@@ -314,10 +312,10 @@ graph TB
    - Pre-call and post-response interception (moderation, PII, transformation)
  - [ ] `p1` - **ID**: `cpt-cf-llm-gateway-component-quota-manager`
    - Quota Manager
-   - Pre-request AI credit quota checks (specific component TBD — see PRD Open Questions)
+   - Pre-request AI credit quota checks (pending: specific component to be determined — see PRD Open Questions)
  - [ ] `p1` - **ID**: `cpt-cf-llm-gateway-component-usage-tracker`
    - Usage Tracker
-   - AI credit consumption reporting (tokens converted to credits via Model Registry prices)
+   - AI credit consumption reporting (tokens converted to credits via Model Registry prices). Usage Tracker SDK handles guaranteed at-least-once delivery
  - [ ] `p1` - **ID**: `cpt-cf-llm-gateway-component-audit-module`
    - Audit Module
    - Compliance event logging
@@ -326,7 +324,7 @@ graph TB
 - Consumer → API Layer: Normalized requests
 - Application Layer → Model Registry: Model resolution, availability check, and per-model pricing for AI credit conversion
 - Application Layer → Quota Manager: Pre-request AI credit quota checks
-- Application Layer → Usage Tracker: Post-request AI credit consumption reporting
+- Application Layer → Usage Tracker: AI credit consumption reporting via Usage Tracker SDK (at-least-once delivery handled by SDK)
 - Application Layer → Type Registry: Tool schema resolution
 - Application Layer → FileStorage: Media fetch/store
 - Provider Adapters → Outbound API GW: Provider API calls
@@ -339,8 +337,8 @@ graph TB
 | Outbound API Gateway | External API calls to providers |
 | FileStorage | Media storage and retrieval |
 | Type Registry | Tool schema resolution |
-| Quota Manager | Pre-request AI credit quota checks (specific component TBD) |
-| Usage Tracker | AI credit consumption reporting |
+| Quota Manager | Pre-request AI credit quota checks (pending: specific component to be determined — see PRD Open Questions) |
+| Usage Tracker | AI credit consumption reporting (at-least-once delivery handled by Usage Tracker SDK) |
 
 ### 3.3 API Contracts
 
@@ -577,6 +575,8 @@ sequenceDiagram
 
 #### Create Response (Sync)
 
+- [ ] `p1` - **ID**: `cpt-cf-llm-gateway-seq-create-response-sync-v1`
+
 **Use cases**: `cpt-cf-llm-gateway-usecase-chat-completion-v1`
 **Actors**: `cpt-cf-llm-gateway-actor-consumer`
 
@@ -597,6 +597,8 @@ sequenceDiagram
 ```
 
 #### Create Response (Streaming)
+
+- [ ] `p1` - **ID**: `cpt-cf-llm-gateway-seq-streaming-v1`
 
 **Use cases**: `cpt-cf-llm-gateway-usecase-streaming-v1`
 **Actors**: `cpt-cf-llm-gateway-actor-consumer`
@@ -626,6 +628,8 @@ sequenceDiagram
 
 #### Embeddings Generation
 
+- [ ] `p1` - **ID**: `cpt-cf-llm-gateway-seq-embeddings-v1`
+
 **Use cases**: `cpt-cf-llm-gateway-usecase-embeddings-v1`
 **Actors**: `cpt-cf-llm-gateway-actor-consumer`
 
@@ -645,6 +649,8 @@ sequenceDiagram
 ```
 
 #### Vision (Image Analysis)
+
+- [ ] `p1` - **ID**: `cpt-cf-llm-gateway-seq-vision-v1`
 
 **Use cases**: `cpt-cf-llm-gateway-usecase-vision-v1`
 **Actors**: `cpt-cf-llm-gateway-actor-consumer`
@@ -669,6 +675,8 @@ sequenceDiagram
 
 #### Image Generation
 
+- [ ] `p1` - **ID**: `cpt-cf-llm-gateway-seq-image-generation-v1`
+
 **Use cases**: `cpt-cf-llm-gateway-usecase-image-generation-v1`
 **Actors**: `cpt-cf-llm-gateway-actor-consumer`
 
@@ -691,6 +699,8 @@ sequenceDiagram
 ```
 
 #### Speech-to-Text
+
+- [ ] `p3` - **ID**: `cpt-cf-llm-gateway-seq-speech-to-text-v1`
 
 **Use cases**: `cpt-cf-llm-gateway-usecase-speech-to-text-v1`
 **Actors**: `cpt-cf-llm-gateway-actor-consumer`
@@ -715,6 +725,8 @@ sequenceDiagram
 
 #### Text-to-Speech
 
+- [ ] `p1` - **ID**: `cpt-cf-llm-gateway-seq-text-to-speech-v1`
+
 **Use cases**: `cpt-cf-llm-gateway-usecase-text-to-speech-v1`
 **Actors**: `cpt-cf-llm-gateway-actor-consumer`
 
@@ -737,6 +749,8 @@ sequenceDiagram
 ```
 
 #### Video Understanding
+
+- [ ] `p1` - **ID**: `cpt-cf-llm-gateway-seq-video-understanding-v1`
 
 **Use cases**: `cpt-cf-llm-gateway-usecase-video-understanding-v1`
 **Actors**: `cpt-cf-llm-gateway-actor-consumer`
@@ -761,6 +775,8 @@ sequenceDiagram
 
 #### Video Generation
 
+- [ ] `p3` - **ID**: `cpt-cf-llm-gateway-seq-video-generation-v1`
+
 **Use cases**: `cpt-cf-llm-gateway-usecase-video-generation-v1`
 **Actors**: `cpt-cf-llm-gateway-actor-consumer`
 
@@ -783,6 +799,8 @@ sequenceDiagram
 ```
 
 #### Tool/Function Calling
+
+- [ ] `p1` - **ID**: `cpt-cf-llm-gateway-seq-tool-calling-v1`
 
 **Use cases**: `cpt-cf-llm-gateway-usecase-tool-calling-v1`
 **Actors**: `cpt-cf-llm-gateway-actor-consumer`
@@ -816,6 +834,8 @@ sequenceDiagram
 
 #### Structured Output
 
+- [ ] `p1` - **ID**: `cpt-cf-llm-gateway-seq-structured-output-v1`
+
 **Use cases**: `cpt-cf-llm-gateway-usecase-structured-output-v1`
 **Actors**: `cpt-cf-llm-gateway-actor-consumer`
 
@@ -839,6 +859,8 @@ sequenceDiagram
 
 #### Document Understanding
 
+- [ ] `p1` - **ID**: `cpt-cf-llm-gateway-seq-document-understanding-v1`
+
 **Use cases**: `cpt-cf-llm-gateway-usecase-document-understanding-v1`
 **Actors**: `cpt-cf-llm-gateway-actor-consumer`
 
@@ -861,6 +883,8 @@ sequenceDiagram
 ```
 
 #### Async Jobs / Background Mode
+
+- [ ] `p1` - **ID**: `cpt-cf-llm-gateway-seq-async-jobs-v1`
 
 **Use cases**: `cpt-cf-llm-gateway-usecase-async-jobs-v1`
 **Actors**: `cpt-cf-llm-gateway-actor-consumer`
@@ -891,6 +915,8 @@ sequenceDiagram
 
 #### Realtime Audio
 
+- [ ] `p3` - **ID**: `cpt-cf-llm-gateway-seq-realtime-audio-v1`
+
 **Use cases**: `cpt-cf-llm-gateway-usecase-realtime-audio-v1`
 **Actors**: `cpt-cf-llm-gateway-actor-consumer`
 
@@ -920,6 +946,8 @@ sequenceDiagram
 
 #### Provider Fallback
 
+- [ ] `p2` - **ID**: `cpt-cf-llm-gateway-seq-provider-fallback-v1`
+
 **Use cases**: `cpt-cf-llm-gateway-usecase-provider-fallback-v1`
 **Actors**: `cpt-cf-llm-gateway-actor-consumer`
 
@@ -945,6 +973,8 @@ sequenceDiagram
 ```
 
 #### Timeout Enforcement
+
+- [ ] `p2` - **ID**: `cpt-cf-llm-gateway-seq-timeout-v1`
 
 **Use cases**: `cpt-cf-llm-gateway-usecase-timeout-v1`
 **Actors**: `cpt-cf-llm-gateway-actor-consumer`
@@ -983,6 +1013,8 @@ sequenceDiagram
 
 #### Pre-Call Interceptor
 
+- [ ] `p2` - **ID**: `cpt-cf-llm-gateway-seq-pre-call-interceptor-v1`
+
 **Use cases**: `cpt-cf-llm-gateway-usecase-pre-call-interceptor-v1`
 **Actors**: `cpt-cf-llm-gateway-actor-consumer`
 
@@ -1007,6 +1039,8 @@ sequenceDiagram
 ```
 
 #### Post-Response Interceptor
+
+- [ ] `p2` - **ID**: `cpt-cf-llm-gateway-seq-post-response-interceptor-v1`
 
 **Use cases**: `cpt-cf-llm-gateway-usecase-post-response-interceptor-v1`
 **Actors**: `cpt-cf-llm-gateway-actor-consumer`
@@ -1035,6 +1069,8 @@ sequenceDiagram
 
 #### Rate Limiting
 
+- [ ] `p2` - **ID**: `cpt-cf-llm-gateway-seq-rate-limiting-v1`
+
 **Use cases**: `cpt-cf-llm-gateway-usecase-rate-limiting-v1`
 **Actors**: `cpt-cf-llm-gateway-actor-consumer`
 
@@ -1060,6 +1096,8 @@ sequenceDiagram
 
 #### Budget Enforcement
 
+- [ ] `p2` - **ID**: `cpt-cf-llm-gateway-seq-budget-enforcement-v1`
+
 **Use cases**: `cpt-cf-llm-gateway-fr-budget-enforcement-v1`
 **Actors**: `cpt-cf-llm-gateway-actor-consumer`, `cpt-cf-llm-gateway-actor-quota-manager`, `cpt-cf-llm-gateway-actor-usage-tracker`
 
@@ -1071,7 +1109,7 @@ sequenceDiagram
     participant MR as Model Registry
     participant OB as Outbound API Gateway
     participant P as Provider
-    participant UT as Usage Tracker
+    participant UT as Usage Tracker SDK
 
     C->>GW: POST /responses (...)
     GW->>QM: check_quota(tenant)
@@ -1088,7 +1126,7 @@ sequenceDiagram
         MR-->>GW: price_per_token
         GW->>GW: Convert tokens → AI credits
         GW->>UT: report_usage(tenant, model, ai_credits)
-        UT-->>GW: ok
+        UT-->>GW: ok (accepted for delivery)
         GW-->>C: Response
     end
 ```
@@ -1098,11 +1136,13 @@ sequenceDiagram
 2. **Reject if exceeded**: Returns `budget_exceeded` error immediately
 3. **Process request**: If quota available, proceed with provider call
 4. **Convert to AI credits**: After response, Gateway obtains per-model pricing from Model Registry and converts consumed tokens to AI credits
-5. **Report usage**: Report AI credit consumption to Usage Tracker
+5. **Report usage**: Call Usage Tracker SDK `report_usage()` — the SDK handles guaranteed at-least-once delivery internally (transactional outbox, retries)
 
-Note: Gateway may consume more AI credits than the tenant's allocated quota because token consumption cannot be predicted before the request completes. The pre-request quota check is a best-effort gate — actual consumption may exceed the quota. This is expected behavior.
+Note: Gateway may consume more AI credits than the tenant's allocated quota because token consumption cannot be predicted before the request completes. The pre-request quota check is a best-effort gate — actual consumption may exceed the quota. This is expected behavior. Usage Tracker unavailability does not block request processing — the SDK buffers records and delivers them when the tracker becomes available.
 
 #### Batch Processing
+
+- [ ] `p3` - **ID**: `cpt-cf-llm-gateway-seq-batch-processing-v1`
 
 **Use cases**: `cpt-cf-llm-gateway-usecase-batch-processing-v1`
 **Actors**: `cpt-cf-llm-gateway-actor-consumer`
@@ -1114,8 +1154,8 @@ sequenceDiagram
     participant OB as Outbound API Gateway
     participant P as Provider
 
-    C->>GW: create_batch(requests[])
-    GW->>OB: Submit batch
+    C->>GW: create_batch(input_file_url)
+    GW->>OB: Submit batch (fetch input from FileStorage, upload to provider)
     OB->>P: Provider batch API
     P-->>OB: batch_id
     OB-->>GW: batch_id
@@ -1124,32 +1164,122 @@ sequenceDiagram
     C->>GW: get_batch(batch_id)
     GW->>OB: Check status
     OB->>P: Poll batch
-    P-->>OB: status + results[]
-    OB-->>GW: status + results[]
-    GW-->>C: status + results[]
+    P-->>OB: status + results
+    OB->>GW: store results to FileStorage
+    GW-->>C: status + results_file_url
 ```
 
-**Tenant isolation**: Gateway is stateless, but batch metadata is stored in distributed cache:
-- On `create_batch`: Gateway stores `{batch_id → tenant_id, provider_batch_id, created_at}` in cache
-- On `get_batch`: Gateway retrieves tenant_id from cache, validates caller has access
-- Cache TTL matches batch expiration policy
+**Tenant isolation**: Batch metadata is persisted in the database (see section 3.5):
+- On `create_batch`: consumer provides a FileStorage URL for the input file; Gateway stores `{batch_id, tenant_id, provider_batch_id, input_file_url, created_at, expires_at}` in the `batches` table
+- On `get_batch`: Gateway queries by batch_id with SecureConn tenant filtering, ensuring callers can only access their own batches; when the provider signals completion, Gateway writes results to FileStorage and stores the generated `results_file_url` in the `batches` row
+- Expired records are cleaned up by the background purge task (NFR `cpt-cf-llm-gateway-nfr-data-retention-v1`)
 
-This is the same pattern used for async jobs (see ADR-0001).
+This is the same persistence pattern used for async jobs (see ADR-0001).
 
 ### 3.5 Database schemas & tables
 
-<!-- Not applicable - Gateway is stateless except for temporary async job state -->
+Gateway uses persistent database storage for async/batch job state. All tables use SecureConn with tenant-scoped access.
 
-### 3.6: Topology (optional)
+**ID**: `cpt-cf-llm-gateway-db-persistence`
 
-<!-- To be defined during implementation -->
+#### Jobs table
 
-### 3.7: Tech stack (optional)
+- [ ] `p1` - **ID**: `cpt-cf-llm-gateway-dbtable-jobs`
 
-<!-- To be defined during implementation -->
+Stores async job state and results. Rows are created when a `background: true` request is received and retained until TTL expires (10 minutes for LLM completions, 48 hours for batch jobs per NFR `cpt-cf-llm-gateway-nfr-data-retention-v1`).
+
+| Column | Type | Description |
+|--------|------|-------------|
+| id | UUID (PK) | Gateway-generated job ID |
+| tenant_id | UUID | Tenant owning the job (SecureConn filter) |
+| provider_job_id | String (nullable) | Provider's internal job ID (for providers with native async) |
+| status | Enum | pending, running, completed, failed, cancelled |
+| request | JSONB | Serialized CreateResponseBody |
+| result | JSONB (nullable) | Serialized ResponseResource (populated on completion) |
+| error | JSONB (nullable) | Serialized Error (populated on failure) |
+| model_id | String | Resolved model identifier |
+| created_at | Timestamp | Job creation time |
+| completed_at | Timestamp (nullable) | Job completion time |
+| expires_at | Timestamp | TTL expiration (created_at + retention period) |
+
+Indexes: `(tenant_id, id)`, `(expires_at)` for purge task.
+
+#### Batches table
+
+- [ ] `p3` - **ID**: `cpt-cf-llm-gateway-dbtable-batches`
+
+Stores batch job metadata and individual request results. Same retention policy as jobs.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| id | UUID (PK) | Gateway-generated batch ID |
+| tenant_id | UUID | Tenant owning the batch (SecureConn filter) |
+| provider_batch_id | String (nullable) | Provider's internal batch ID |
+| status | Enum | pending, in_progress, completed, failed, cancelled |
+| input_file_url | String | FileStorage URL of the input file provided by the consumer |
+| results_file_url | String (nullable) | FileStorage URL generated by Gateway for the consumer to retrieve results; populated when provider signals completion |
+| created_at | Timestamp | Batch creation time |
+| expires_at | Timestamp | TTL expiration |
+
+**Background tasks**:
+- **Job purge task**: Periodically deletes rows from `jobs` and `batches` where `expires_at < now()`.
 
 ## 4. Additional Context
 
-<!-- To be added as needed -->
+### 4.1 Quality Attribute Coverage
+
+The following quality attribute domains are addressed at the platform level or explicitly scoped out for this module.
+
+#### Performance
+
+Stateless request processing enables horizontal scaling — any instance can serve any request. Provider responses are not cached — each request is a fresh provider call. Async job polling avoids long-held connections. Streaming (SSE) reduces time-to-first-token perceived latency. Database storage for job/batch records uses TTL-based retention and background purge to bound row growth (up to 50,000 rows/day across all tenants, per PRD capacity planning).
+
+#### Security
+
+Authentication and authorization are handled by the ModKit platform (SecureConn, AccessScope). Provider credentials are never stored or accessed by Gateway — credential injection is performed by Outbound API Gateway (constraint `cpt-cf-llm-gateway-constraint-no-credentials`). Full request/response content is not logged due to PII concerns (constraint `cpt-cf-llm-gateway-constraint-content-logging`). Tenant isolation is enforced at the platform level via SecurityContext. Pre-call and post-response hook plugins (`cpt-cf-llm-gateway-component-hook-plugin`) provide content moderation and PII filtering extension points.
+
+#### Reliability
+
+Circuit breaking is handled at the infrastructure level by Outbound API Gateway — see `cpt-cf-llm-gateway-adr-circuit-breaking`. Business-level health routing uses Model Registry health metrics to avoid unhealthy providers (`cpt-cf-llm-gateway-seq-provider-resolution-v1`). Provider fallback chains provide redundancy for critical models (`cpt-cf-llm-gateway-seq-provider-fallback-v1`). Timeout enforcement (TTFT + total) prevents hung requests (`cpt-cf-llm-gateway-seq-timeout-v1`). Retry logic is delegated to Outbound API Gateway. Usage record delivery is guaranteed at-least-once by the Usage Tracker SDK (transactional outbox handled internally by the SDK) — Usage Tracker unavailability does not block request processing. Native async job state (provider_job_id stored in DB) survives Gateway instance restarts with zero data loss — polling resumes after restart (NFR `cpt-cf-llm-gateway-nfr-recovery-v1`). Simulated async jobs (in-flight sync provider calls) are not recovered on restart and are marked failed to prevent unauthorized token spending.
+
+#### Data Architecture
+
+Gateway owns persistent database tables for async/batch job records (see section 3.5). Job records are retained with TTL-based expiration: 10 minutes for LLM completion jobs, 48 hours for batch jobs (NFR `cpt-cf-llm-gateway-nfr-data-retention-v1`). A background purge task cleans up expired rows. Usage record delivery (transactional outbox) is owned by the Usage Tracker SDK. All media storage is delegated to FileStorage (ADR `cpt-cf-llm-gateway-adr-file-storage`). Domain model entities are defined in section 3.1.
+
+#### Integration
+
+Gateway integrates with external LLM providers exclusively through Outbound API Gateway (constraint `cpt-cf-llm-gateway-constraint-outbound-dependency`). Integration patterns are synchronous (REST) for standard requests, SSE for streaming, and WebSocket for realtime audio. Internal module communication uses ModKit SDK traits via ClientHub (Model Registry, Type Registry, FileStorage, Quota Manager, Usage Tracker, Audit Module).
+
+#### Operations
+
+Not applicable at the module level — Gateway is deployed as part of the hyperspot-server binary. Observability (logging, metrics, distributed tracing) is provided by the ModKit platform. Gateway emits structured audit events via the Audit Module (`cpt-cf-llm-gateway-fr-audit-events-v1`). Health checks are provided by the platform.
+
+#### Maintainability
+
+Gateway follows the standard ModKit module pattern (two-crate SDK pattern, DDD-light layers). Provider adapters are isolated behind a common trait, enabling addition of new providers without modifying core logic. Extension points: hook plugins for pre/post processing, tool type extensions via GTS Type Registry.
+
+#### Testing
+
+Not applicable at the DESIGN level — testing strategy will be defined in FEATURE artifacts. Unit tests will cover adapter translation logic, integration tests will verify end-to-end flows with mocked providers, and E2E tests will validate the full request/response cycle.
+
+#### Compliance
+
+Not applicable — Gateway does not handle compliance directly. Content logging restrictions (constraint `cpt-cf-llm-gateway-constraint-content-logging`) and audit event emission (`cpt-cf-llm-gateway-fr-audit-events-v1`) support downstream compliance requirements. Tenant-level data governance is enforced by the platform.
+
+#### Usability
+
+Not applicable — Gateway exposes a programmatic API (REST/WebSocket) consumed by other services, not a user-facing interface.
+
+#### Business Alignment
+
+All functional requirements (23 FRs) and non-functional requirements (4 NFRs) from the PRD are mapped to architecture drivers in section 1.2. Business capabilities (provider abstraction, governance, security) are realized through the component model in section 3.2.
 
 ## 5. Traceability
+
+| Source | Direction | Target | Coverage |
+|--------|-----------|--------|----------|
+| PRD FRs (23) | → | DESIGN Architecture Drivers (section 1.2) | All covered |
+| PRD NFRs (4) | → | DESIGN Architecture Drivers (section 1.2) | All covered |
+| ADRs (7) | → | DESIGN Architecture Drivers + inline on principles/constraints | All covered |
+| DESIGN Components (7) | → | DECOMPOSITION | Pending |
+| DESIGN Sequences (22) | → | FEATURE | Pending |

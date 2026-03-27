@@ -458,7 +458,11 @@ The following quality domains are handled at the platform level and do not requi
 
 - [ ] `p2` - **ID**: `cpt-cf-llm-gateway-nfr-recovery-v1`
 
-Async and batch job state must survive Gateway instance restarts with zero data loss (RPO: 0). Recovery time is bounded by infrastructure restart time (RTO: platform-defined). Persistent storage availability is an infrastructure concern.
+**Native async jobs** (provider supports async natively — Gateway stores the provider job ID and resumes polling after restart): job state and results must survive Gateway instance restarts with zero data loss (RPO: 0). Recovery time is bounded by infrastructure restart time (RTO: platform-defined). Persistent storage availability is an infrastructure concern.
+
+**Simulated async jobs** (sync provider + async request — Gateway executes the provider call synchronously on behalf of the consumer): NOT guaranteed to survive Gateway outages. If the Gateway instance is interrupted mid-execution, the in-flight provider call is lost and the job is marked failed. Interrupted simulated jobs are not retried to prevent unauthorized spending of provider tokens — the consumer receives a failed job status and must resubmit if desired.
+
+Batch job metadata (ID mappings, status) survives restarts. Individual batch request results follow the same native/simulated distinction as async jobs.
 
 ## 7. Public Library Interfaces
 
