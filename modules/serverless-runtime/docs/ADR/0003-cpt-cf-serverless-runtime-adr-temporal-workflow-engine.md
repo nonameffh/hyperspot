@@ -3,7 +3,7 @@ Created:  2026-03-30 by Constructor Tech
 Updated:  2026-03-30 by Constructor Tech
 -->
 ---
-status: proposed
+status: accepted
 date: 2026-03-30
 ---
 <!--
