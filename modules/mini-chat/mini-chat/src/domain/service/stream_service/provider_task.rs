@@ -733,9 +733,9 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                                     usage: Some(usage),
                                     effective_model: fctx.effective_model.clone(),
                                     selected_model: fctx.selected_model.clone(),
-                                    quota_decision: "allow".into(),
-                                    downgrade_from: None,
-                                    downgrade_reason: None,
+                                    quota_decision: fctx.quota_decision.clone(),
+                                    downgrade_from: fctx.downgrade_from.clone(),
+                                    downgrade_reason: fctx.downgrade_reason.clone(),
                                     quota_warnings: None,
                                 })))
                                 .await;
@@ -842,9 +842,9 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                                     usage: Some(usage),
                                     effective_model: fctx.effective_model.clone(),
                                     selected_model: fctx.selected_model.clone(),
-                                    quota_decision: "allow".into(),
-                                    downgrade_from: None,
-                                    downgrade_reason: None,
+                                    quota_decision: fctx.quota_decision.clone(),
+                                    downgrade_from: fctx.downgrade_from.clone(),
+                                    downgrade_reason: fctx.downgrade_reason.clone(),
                                     quota_warnings: None,
                                 })))
                                 .await;
