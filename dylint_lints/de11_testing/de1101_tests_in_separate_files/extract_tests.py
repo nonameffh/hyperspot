@@ -111,7 +111,7 @@ def process_file(fpath):
 
     # Build test file content
     if not has_super_import(test_body):
-        test_content = "use super::*;\n\n" + test_body
+        test_content = "#[allow(unused_imports)]\nuse super::*;\n\n" + test_body
     else:
         test_content = test_body
 
@@ -160,6 +160,18 @@ def find_cfg_test_items(fpath):
     return items
 
 
+## Directories that must be skipped entirely.
+## - `tests/` contains integration tests (separate crates, `super` is invalid)
+## - `ui/` contains dylint UI-example fixtures that must keep inline tests
+SKIP_DIRS = {"tests", "ui", "target", ".git"}
+
+
+def should_skip(root):
+    """Return True if *root* is inside a directory that must not be touched."""
+    parts = root.replace("\\", "/").split("/")
+    return bool(SKIP_DIRS.intersection(parts))
+
+
 def main():
     if len(sys.argv) < 2:
         print(f"Usage: {sys.argv[0]} <directory>")
@@ -169,6 +181,8 @@ def main():
     count = 0
 
     for root, dirs, files in os.walk(target_dir):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+
         for fname in sorted(files):
             if not fname.endswith(".rs"):
                 continue
@@ -184,6 +198,7 @@ def main():
     print("\nChecking for #[cfg(test)] on individual items (may need manual fix)...")
     warn_count = 0
     for root, dirs, files in os.walk(target_dir):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
         for fname in sorted(files):
             if not fname.endswith(".rs") or fname.endswith("_tests.rs") or fname.endswith("_test.rs"):
                 continue
