@@ -6,6 +6,55 @@ Contains all formal GTS JSON Schema definitions extracted from the design docume
 Each schema is preserved exactly as defined in the original design, grouped by entity.
 -->
 
+## Implementation Notes
+
+### Extension Mechanism Policy
+
+Several schemas in this document use `additionalProperties: false` at the top level combined with a `metadata: { additionalProperties: true }` property for extension data. This pattern is intentional and follows a consistent policy:
+
+- **`additionalProperties: false`** on the base schema prevents uncontrolled field sprawl. Unknown top-level fields are rejected at validation time.
+- **`metadata: { additionalProperties: true }`** provides a single, well-known extension point for runtime-opaque data. Adapters and plugins use `metadata` to store adapter-specific configuration that the platform passes through without validation.
+- **GTS `allOf` derivation** (e.g., Starlark Limits extending base Limits) adds **typed** fields to derived schemas. These fields are validated against the derived schema and are first-class properties, not opaque bags.
+
+The distinction: use `metadata` for runtime-opaque adapter data that the platform does not need to understand or validate. Use GTS `allOf` derivation for typed extensions where the platform validates the additional fields against a registered schema. Do not mix the two mechanisms on the same set of fields — `metadata` is the escape hatch for genuinely unstructured data; `allOf` is for structured, validated extensions.
+
+### Shared CallableBase (Rust Implementation)
+
+The Function and Workflow GTS schemas are independent sibling types with no `allOf`/`$ref` relationship (see [ADR-0001](ADR/0001-cpt-cf-serverless-runtime-adr-callable-type-hierarchy.md)). This means the JSON schemas intentionally duplicate ~130 lines of shared base fields (`version`, `tenant_id`, `owner`, `status`, `tags`, `title`, `description`, `schema`, `traits`, `implementation`, `created_at`, `updated_at`).
+
+The GTS schemas must remain independent for correct type matching and routing. However, the **Rust implementation** should use a shared `CallableBase` struct via composition to avoid code duplication:
+
+```rust
+/// Shared base fields for functions and workflows.
+/// GTS schemas stay independent; this struct exists only in the Rust SDK.
+pub struct CallableBase {
+    pub version: String,
+    pub tenant_id: String,
+    pub owner: OwnerRef,
+    pub status: LifecycleStatus,
+    pub tags: Vec<String>,
+    pub title: String,
+    pub description: Option<String>,
+    pub schema: IoSchema,
+    pub traits: CallableTraits,
+    pub implementation: Implementation,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+pub struct FunctionDefinition {
+    pub base: CallableBase,
+    // Function has no additional fields beyond CallableBase
+}
+
+pub struct WorkflowDefinition {
+    pub base: CallableBase,
+    pub workflow_traits: WorkflowTraits,
+}
+```
+
+Serialization to/from GTS JSON flattens the `base` fields into the top-level object so the wire format matches the GTS schema exactly. The `CallableBase` struct is an SDK-internal implementation detail not visible in the GTS schemas.
+
 ## Shared Components
 
 ### OwnerRef
@@ -1221,10 +1270,14 @@ Workflow is a sibling peer of Function — an independent base type, not derived
       "type": "string",
       "description": "Opaque unique identifier for this invocation."
     },
+    "callable_type": {
+      "type": "string",
+      "enum": ["function", "workflow"],
+      "description": "Type of the invoked callable. Determines which GTS type family function_id belongs to."
+    },
     "function_id": {
       "type": "string",
-      "x-gts-ref": "gts.x.core.sless.function.v1~*",
-      "description": "GTS ID of the invoked function or workflow. For functions use gts.x.core.sless.function.v1~*; for workflows use gts.x.core.sless.workflow.v1~*."
+      "description": "GTS ID of the invoked function or workflow. Must match gts.x.core.sless.function.v1~* when callable_type is 'function', or gts.x.core.sless.workflow.v1~* when callable_type is 'workflow'."
     },
     "function_version": {
       "type": "string",
@@ -1439,10 +1492,15 @@ Workflow is a sibling peer of Function — an independent base type, not derived
     "tenant_id": {
       "type": "string"
     },
+    "callable_type": {
+      "type": "string",
+      "enum": ["function", "workflow"],
+      "default": "function",
+      "description": "Type of the referenced callable. Determines which GTS type family function_id belongs to: 'function' requires gts.x.core.sless.function.v1~*, 'workflow' requires gts.x.core.sless.workflow.v1~*. If absent, inferred from the GTS type prefix of function_id."
+    },
     "function_id": {
       "type": "string",
-      "x-gts-ref": "gts.x.core.sless.function.v1~*",
-      "description": "GTS ID of the function or workflow to invoke. For functions use gts.x.core.sless.function.v1~*; for workflows use gts.x.core.sless.workflow.v1~*."
+      "description": "GTS ID of the function or workflow to invoke. Must match gts.x.core.sless.function.v1~* when callable_type is 'function', or gts.x.core.sless.workflow.v1~* when callable_type is 'workflow'."
     },
     "name": {
       "type": "string",
@@ -1617,10 +1675,15 @@ Workflow is a sibling peer of Function — an independent base type, not derived
         }
       }
     },
+    "callable_type": {
+      "type": "string",
+      "enum": ["function", "workflow"],
+      "default": "function",
+      "description": "Type of the referenced callable. Determines which GTS type family function_id belongs to: 'function' requires gts.x.core.sless.function.v1~*, 'workflow' requires gts.x.core.sless.workflow.v1~*. If absent, inferred from the GTS type prefix of function_id."
+    },
     "function_id": {
       "type": "string",
-      "x-gts-ref": "gts.x.core.sless.function.v1~*",
-      "description": "GTS ID of the function or workflow to invoke. For functions use gts.x.core.sless.function.v1~*; for workflows use gts.x.core.sless.workflow.v1~*."
+      "description": "GTS ID of the function or workflow to invoke. Must match gts.x.core.sless.function.v1~* when callable_type is 'function', or gts.x.core.sless.workflow.v1~* when callable_type is 'workflow'."
     },
     "batch": {
       "type": "object",
@@ -1679,10 +1742,15 @@ Workflow is a sibling peer of Function — an independent base type, not derived
     "tenant_id": {
       "type": "string"
     },
+    "callable_type": {
+      "type": "string",
+      "enum": ["function", "workflow"],
+      "default": "function",
+      "description": "Type of the referenced callable. Determines which GTS type family function_id belongs to: 'function' requires gts.x.core.sless.function.v1~*, 'workflow' requires gts.x.core.sless.workflow.v1~*. If absent, inferred from the GTS type prefix of function_id."
+    },
     "function_id": {
       "type": "string",
-      "x-gts-ref": "gts.x.core.sless.function.v1~*",
-      "description": "GTS ID of the function or workflow to invoke. For functions use gts.x.core.sless.function.v1~*; for workflows use gts.x.core.sless.workflow.v1~*."
+      "description": "GTS ID of the function or workflow to invoke. Must match gts.x.core.sless.function.v1~* when callable_type is 'function', or gts.x.core.sless.workflow.v1~* when callable_type is 'workflow'."
     },
     "authentication": {
       "type": "object",

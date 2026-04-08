@@ -38,6 +38,8 @@ date: 2026-03-23
   - [Option B: Entrypoint → Function | Workflow (abstract entrypoint base) — rejected](#option-b-entrypoint--function--workflow-abstract-entrypoint-base--rejected)
   - [Option C: Callable → Function | Workflow (abstract callable base) — rejected](#option-c-callable--function--workflow-abstract-callable-base--rejected)
 - [More Information](#more-information)
+  - [Code-Level Callable Resolution in ModKit](#code-level-callable-resolution-in-modkit)
+  - [GTS Schema Callable References](#gts-schema-callable-references)
 - [Traceability](#traceability)
 
 <!-- /toc -->
@@ -176,6 +178,48 @@ The previous project's `Entrypoint` type was introduced when all callables were 
 The intermediate `function → workflow` model (Option A) was a reasonable step: a workflow is genuinely a superset of a function at the semantic level. However, encoding this at the GTS type level creates a routing hazard: any runtime registered to handle `gts.x.core.sless.function.v1~` would, by GTS inheritance rules, also match workflow instances unless it explicitly excluded them. The sibling model eliminates this hazard entirely. The "conceptually a superset" relationship is documented here and in the schema descriptions, but not encoded as GTS inheritance.
 
 The execution mode (sync vs async) and invocation role (direct target vs helper vs abstract base) are orthogonal to type identity and are handled via invocation parameters and runtime configuration, not via the GTS type hierarchy.
+
+### Code-Level Callable Resolution in ModKit
+
+The sibling model has a direct implication for how "any callable" references work at the code level in ModKit. `ClientHub` resolves dependencies by trait type, not by GTS type — so there is no single `hub.get::<dyn CallableClient>()` that returns both functions and workflows.
+
+**Chosen approach:** The SDK defines a single `ServerlessRuntimeClient` trait (see [DESIGN.md, section 1.4.3](../DESIGN.md#143-sdk-crate)) whose methods accept callable references by GTS ID string. The client implementation resolves internally whether the ID refers to a function or workflow by inspecting the GTS type prefix (`function.v1~` vs `workflow.v1~`). This avoids requiring callers to make two separate `hub.get_scoped::<dyn ...>()` calls or to know the callable type in advance.
+
+```rust
+// Caller does not need to know if the target is a function or workflow:
+let sless = hub.get::<dyn ServerlessRuntimeClient>()?;
+let record = sless.invoke(ctx, InvokeRequest {
+    function_id: "gts.x.core.sless.workflow.v1~vendor.app.orders.process_order.v1~".into(),
+    mode: InvocationMode::Async,
+    params: serde_json::json!({ "order_id": "ORD-123" }),
+    ..Default::default()
+}).await?;
+```
+
+**Rejected alternative:** A union `CallableClient` trait wrapping separate `FunctionClient` and `WorkflowClient` traits was considered but rejected because it would force all callers to choose a branch at call time, negating the benefit of the unified invocation surface.
+
+### GTS Schema Callable References
+
+Schedule, Trigger, and Webhook Trigger schemas use `function_id` with `x-gts-ref: gts.x.core.sless.function.v1~*`. The description text notes that workflows use `workflow.v1~*`, but the `x-gts-ref` constraint only matches functions. This is a known inconsistency addressed as follows:
+
+- The `function_id` field is renamed to `callable_id` in the Rust SDK models (`models.rs`) to accurately reflect that it accepts both types.
+- The GTS schemas retain `function_id` for backward compatibility but add a `callable_type` discriminator field:
+
+```json
+{
+  "callable_type": {
+    "type": "string",
+    "enum": ["function", "workflow"],
+    "description": "Type of the referenced callable. Determines which GTS type family the callable_id belongs to."
+  },
+  "function_id": {
+    "type": "string",
+    "description": "GTS ID of the callable. Must match gts.x.core.sless.function.v1~* when callable_type is 'function', or gts.x.core.sless.workflow.v1~* when callable_type is 'workflow'."
+  }
+}
+```
+
+- Validation logic checks that `function_id` matches the correct GTS type pattern based on `callable_type`. If `callable_type` is absent, the runtime infers it from the GTS type prefix.
 
 ## Traceability
 

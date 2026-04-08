@@ -7,9 +7,11 @@
   - [1.1 Architectural Vision](#11-architectural-vision)
   - [1.2 Architecture Drivers](#12-architecture-drivers)
   - [1.3 Architecture Layers](#13-architecture-layers)
+  - [1.4 ModKit Integration](#14-modkit-integration)
 - [2. Principles & Constraints](#2-principles--constraints)
   - [2.1 Design Principles](#21-design-principles)
   - [2.2 Constraints](#22-constraints)
+  - [2.3 Industry Comparison and Capability Allocation](#23-industry-comparison-and-capability-allocation)
 - [3. Technical Architecture](#3-technical-architecture)
   - [3.1 Domain Model](#31-domain-model)
   - [3.1.1 Complete Entity Examples](#311-complete-entity-examples)
@@ -77,7 +79,9 @@ DESIGN LANGUAGE:
 
 The Serverless Runtime module provides a stable, implementation-agnostic domain model and API contract for runtime creation, registration, and invocation of functions and workflows. Functions and workflows are unified as **functions** — registered definitions that can be invoked via the runtime API. This unification enables a single invocation surface, consistent response shapes, and shared lifecycle management regardless of the underlying execution technology.
 
-The architecture is designed to support multiple implementation technologies (Temporal, Starlark, cloud-native FaaS) through a pluggable adapter model. Each adapter registers itself as a GTS type and implements the abstract `ServerlessRuntime` trait. The platform validates adapter-specific limits, traits, and implementation payloads against the adapter's registered schemas, ensuring type safety without coupling the core model to any specific runtime.
+The architecture is designed to support multiple implementation technologies (Temporal, Starlark, cloud-native FaaS) through a pluggable adapter model. Each adapter registers itself as a GTS type and implements the `RuntimeAdapter` trait. The platform validates adapter-specific limits, traits, and implementation payloads against the adapter's registered schemas, ensuring type safety without coupling the core model to any specific runtime.
+
+**Scope note — orchestrator core vs. adapter-provided workflow features:** The orchestrator core provides the durable state machine (job lifecycle, retry, compensation, checkpoint persistence, timeout enforcement, scheduling, and tenant isolation). Workflow orchestration features — parallel execution, event waiting, per-step timeouts, deterministic replay, and conditional branching — are delegated to runtime adapters via the `ExecutionContext` host callback API. The platform ships with a Starlark adapter for sequential function chains; full workflow orchestration capabilities are unlocked by plugging in a capable adapter (Temporal, Serverless Workflow 1.0, etc.). This is intentional: the core remains independent of execution engine specifics, and adapters can leverage their native strengths without being constrained by a lowest-common-denominator abstraction. See [section 2.3](#23-industry-comparison-and-capability-allocation) for the detailed capability allocation.
 
 The domain model uses the Global Type System (GTS) for identity, schema validation, and type inheritance. All entities carry GTS identifiers, enabling schema-first validation, version resolution, and consistent cross-module references. Security context propagation, tenant isolation, and governance are built into the API contract layer, ensuring that every operation is scoped, auditable, and policy-compliant.
 
@@ -140,6 +144,602 @@ Requirements that significantly influence architecture decisions.
 | Runtime | Pluggable execution adapters, invocation engine, scheduler, event processing | Rust async traits, adapter plugins |
 | Infrastructure | Persistence, caching, event broker integration, secret management | TBD per deployment |
 
+### 1.4 ModKit Integration
+
+The serverless-runtime capability is implemented as **two ModKit modules** — an **orchestrator** and a **runtime** — following the canonical DDD-light layout defined in [Module Layout and SDK Pattern](../../../docs/modkit_unified_system/02_module_layout_and_sdk_pattern.md). This split mirrors the existing platform architecture where dispatch (stateful, DB-backed, guarantees) and toolboxes (stateless execution) are separate microservices.
+
+**Rationale for the two-module split:**
+
+| Concern | `sless-orchestrator` | `sless-runtime` |
+|---|---|---|
+| **Responsibility** | Job lifecycle, scheduling, triggers, retries, compensation, checkpoint storage | Stateless function/workflow execution |
+| **State** | Stateful — DB-backed (jobs, invocations, checkpoints, schedules) | Stateless — receives work, executes, returns results |
+| **Scaling** | Few instances, distributed locking for job polling | Many instances, scale-to-zero per adapter |
+| **DB** | Yes — `SecureConn`, tenant isolation, advisory locks | No — no database dependency |
+| **Guarantees** | At-least-once delivery, status machine, compensation orchestration | Best-effort execution, timeout enforcement |
+| **ModKit capabilities** | `[db, rest, stateful]` | `[rest]` (or `[grpc]` for internal-only) |
+
+#### 1.4.1 Module Structure
+
+```
+modules/
+  sless-orchestrator/
+    ├─ sless-orchestrator-sdk/            # SDK crate (public API surface)
+    │  ├─ Cargo.toml
+    │  └─ src/
+    │     ├─ lib.rs
+    │     ├─ api.rs                       # SlessOrchestratorClient trait (ClientHub path)
+    │     ├─ models.rs                    # Transport-agnostic domain models
+    │     └─ errors.rs                    # SlessOrchestratorError enum
+    └─ sless-orchestrator/                # Module implementation crate
+       ├─ Cargo.toml
+       └─ src/
+          ├─ lib.rs
+          ├─ module.rs                    # SlessOrchestratorModule + Module/Db/Rest/Stateful impls
+          ├─ config.rs                    # Typed module configuration
+          ├─ api/
+          │  └─ rest/
+          │     ├─ dto.rs                 # HTTP DTOs (serde/utoipa)
+          │     ├─ handlers.rs            # Axum handlers — error→Problem mapping
+          │     └─ routes.rs              # Route & OpenAPI registration
+          ├─ domain/
+          │  ├─ error.rs                  # DomainError (no HTTP concepts)
+          │  ├─ service.rs                # FunctionRegistry, InvocationEngine orchestration
+          │  ├─ scheduler.rs              # SchedulerService — cron evaluation, job creation
+          │  ├─ trigger.rs                # TriggerService — event matching, job creation
+          │  └─ job_worker.rs             # Job polling loop with distributed advisory lock
+          └─ infra/
+             ├─ storage/
+             │  ├─ entity/                # SeaORM entities with #[derive(Scopable)]
+             │  │  ├─ function.rs
+             │  │  ├─ workflow.rs
+             │  │  ├─ invocation.rs
+             │  │  ├─ checkpoint.rs
+             │  │  ├─ schedule.rs
+             │  │  ├─ trigger.rs
+             │  │  ├─ webhook_trigger.rs
+             │  │  └─ tenant_policy.rs
+             │  ├─ repo/                  # Repository implementations using SecureConn
+             │  ├─ mapper.rs              # Entity <-> SDK model conversions
+             │  └─ migrations/
+             └─ plugins/                  # Trigger plugins (webhook, schedule, event)
+
+  sless-runtime/
+    ├─ sless-runtime-sdk/                 # SDK crate
+    │  ├─ Cargo.toml
+    │  └─ src/
+    │     ├─ lib.rs
+    │     ├─ api.rs                       # SlessRuntimeClient trait
+    │     ├─ models.rs                    # ExecuteRequest, ExecuteResult, HealthStatus
+    │     └─ errors.rs                    # SlessRuntimeError enum
+    └─ sless-runtime/                     # Module implementation crate
+       ├─ Cargo.toml
+       └─ src/
+          ├─ lib.rs
+          ├─ module.rs                    # SlessRuntimeModule + Module/Rest impls
+          ├─ domain/
+          │  ├─ executor.rs              # Executor trait — adapter-agnostic execution contract
+          │  └─ context.rs               # Runtime context (host callbacks for checkpoint, status)
+          └─ infra/
+             └─ plugins/                  # Runtime adapter plugins
+```
+
+**Component-to-ModKit mapping:**
+
+| Design Component | Module | ModKit Location | Notes |
+|---|---|---|---|
+| Function Registry | `sless-orchestrator` | `domain/service.rs` | CRUD + status machine + GTS validation |
+| Invocation Engine | `sless-orchestrator` | `domain/service.rs` | Orchestrates invocation lifecycle; creates jobs, tracks status |
+| Job Worker | `sless-orchestrator` | `domain/job_worker.rs` | Polls queued jobs with distributed advisory lock (single-leader) |
+| Scheduler | `sless-orchestrator` | `domain/scheduler.rs` | Background task — evaluates cron schedules, creates invocation jobs |
+| Event Trigger Engine | `sless-orchestrator` | `domain/trigger.rs` | Background task — matches events to triggers, creates invocation jobs |
+| Tenant Policy Manager | `sless-orchestrator` | `domain/service.rs` | Thin service layer for policy CRUD |
+| Persistence layer | `sless-orchestrator` | `infra/storage/` | SeaORM entities + `SecureConn` repositories |
+| Executor (Adapter) | `sless-runtime` | Plugin crates | Each adapter is a ModKit plugin (see 1.4.2) |
+| Executor Pool | `sless-runtime` | `domain/executor.rs` | Manages concurrent execution slots, timeout enforcement |
+| Host Callbacks | `sless-runtime` | `domain/context.rs` | Checkpoint/status reporting back to orchestrator |
+
+**Cross-module communication:** The orchestrator dispatches work to runtime instances through an abstracted `JobTransport` trait (see [1.4.5](#145-job-transport-abstraction)). The runtime calls back to the orchestrator via `SlessOrchestratorClient` for checkpoint persistence and status updates.
+
+#### 1.4.2 Runtime Adapters as ModKit Plugins
+
+Each executor adapter (Starlark, Temporal, Lambda, etc.) is a **ModKit plugin crate** within the `sless-runtime` module, not a compile-time dependency. This follows the same pattern used by `authn-resolver` and `mini-chat` for their plugins (e.g., `choose_plugin_instance` in `modkit::plugins`).
+
+**Constraints:**
+- The `sless-runtime` module crate **must not** depend on any adapter plugin crate. Plugin isolation is enforced at the crate dependency level.
+- Each adapter registers a GTS type (e.g., `gts.x.core.sless.runtime.starlark.v1~`) and a plugin spec trait (e.g., `SlessAdapterPluginSpecV1`).
+- At execution time, the runtime module resolves the adapter using `choose_plugin_instance`:
+
+```rust
+use modkit::plugins::{GtsPluginSelector, choose_plugin_instance};
+
+let adapter_gts_id = choose_plugin_instance::<SlessAdapterPluginSpecV1>(
+    &vendor_selector,
+    instances.iter().map(|e| (e.gts_id.as_str(), &e.content)),
+)?;
+let adapter = hub.get_scoped::<dyn SlessAdapterClientV1>(
+    &ClientScope::ByGtsId(adapter_gts_id),
+)?;
+```
+
+- Plugin selection is based on the `implementation.adapter` GTS type ID from the function definition, passed by the orchestrator in the `ExecuteRequest`.
+
+**Plugin spec type** (defined in `sless-runtime-sdk`):
+
+```rust
+use modkit_macros::struct_to_gts_schema;
+
+/// GTS schema type for runtime adapter plugin instances.
+/// Each adapter registers an instance of this type in the types-registry.
+#[struct_to_gts_schema(
+    base = "gts.x.core.modkit.plugin.v1~",
+    id = "gts.x.core.sless.adapter_plugin.v1~",
+    description = "Serverless runtime adapter plugin specification",
+    properties = ""
+)]
+pub struct SlessAdapterPluginSpecV1;
+```
+
+Each adapter plugin module registers itself during `init()`:
+
+```rust
+// In plugins/starlark-adapter/src/module.rs
+#[async_trait]
+impl Module for StarlarkAdapterPlugin {
+    async fn init(&self, ctx: &ModuleCtx) -> anyhow::Result<()> {
+        let instance_id = SlessAdapterPluginSpecV1::gts_make_instance_id(
+            "x.core.sless.runtime.starlark.v1"
+        );
+
+        // Register instance in types-registry
+        let registry = ctx.client_hub().get::<dyn TypesRegistryClient>()?;
+        let instance = BaseModkitPluginV1::<SlessAdapterPluginSpecV1> {
+            id: instance_id.clone(),
+            vendor: "core".into(),
+            priority: 0,
+            properties: SlessAdapterPluginSpecV1,
+        };
+        registry.register(vec![serde_json::to_value(&instance)?]).await?;
+
+        // Register scoped adapter client
+        let adapter: Arc<dyn RuntimeAdapter> = Arc::new(StarlarkAdapter::new());
+        ctx.client_hub().register_scoped::<dyn RuntimeAdapter>(
+            ClientScope::gts_id(&instance_id),
+            adapter,
+        );
+
+        Ok(())
+    }
+}
+```
+
+#### 1.4.3 SDK Crates
+
+Each module has its own SDK crate following the standard pattern.
+
+**`sless-orchestrator-sdk`** — the primary API surface for external consumers:
+
+```rust
+#[async_trait]
+pub trait SlessOrchestratorClient: Send + Sync {
+    /// Invoke a callable (function or workflow) by GTS ID.
+    async fn invoke(
+        &self,
+        ctx: &SecurityContext,
+        req: InvokeRequest,
+    ) -> Result<InvocationRecord, SlessOrchestratorError>;
+
+    async fn get_function(
+        &self,
+        ctx: &SecurityContext,
+        id: &str,
+    ) -> Result<FunctionDefinition, SlessOrchestratorError>;
+
+    async fn get_invocation(
+        &self,
+        ctx: &SecurityContext,
+        id: &str,
+    ) -> Result<InvocationRecord, SlessOrchestratorError>;
+
+    /// Called by sless-runtime to persist checkpoint data.
+    async fn publish_checkpoint(
+        &self,
+        ctx: &SecurityContext,
+        invocation_id: &str,
+        checkpoint: CheckpointData,
+    ) -> Result<(), SlessOrchestratorError>;
+
+    /// Called by sless-runtime to update invocation status.
+    async fn publish_status(
+        &self,
+        ctx: &SecurityContext,
+        invocation_id: &str,
+        status: InvocationStatus,
+    ) -> Result<(), SlessOrchestratorError>;
+
+    // ... additional CRUD operations for functions, schedules, triggers
+}
+```
+
+**`sless-runtime-sdk`** — consumed by the orchestrator to dispatch execution:
+
+```rust
+#[async_trait]
+pub trait SlessRuntimeClient: Send + Sync {
+    /// Execute a callable. The runtime is stateless — all state
+    /// persistence flows back through SlessOrchestratorClient.
+    async fn execute(
+        &self,
+        ctx: &SecurityContext,
+        req: ExecuteRequest,
+    ) -> Result<ExecuteResult, SlessRuntimeError>;
+
+    /// Health/readiness check for the runtime instance.
+    async fn health(&self) -> Result<HealthStatus, SlessRuntimeError>;
+}
+```
+
+Other modules obtain the orchestrator client via `ClientHub`:
+
+```rust
+let orchestrator = hub.get::<dyn SlessOrchestratorClient>()?;
+let result = orchestrator.invoke(&ctx, req).await?;
+```
+
+**Models**: Each SDK has transport-agnostic structs. Shared types (e.g., `FunctionDefinition`, `InvocationRecord`) live in `sless-orchestrator-sdk` since the orchestrator owns these entities. `sless-runtime-sdk` depends on `sless-orchestrator-sdk` for shared model types.
+
+#### 1.4.4 Error Mapping Layers
+
+ModKit requires three layers of error types with clear separation of concerns. Each module has its own error hierarchy.
+
+**`sless-orchestrator` errors:**
+
+Layer 1 — `DomainError` (`domain/error.rs`):
+Domain-internal errors with no HTTP or transport concepts. Annotated with `#[domain_model]`.
+
+```rust
+#[domain_model]
+pub enum DomainError {
+    FunctionNotFound { id: String },
+    FunctionNotActive { id: String, status: String },
+    ValidationFailed { issues: Vec<ValidationIssue> },
+    QuotaExceeded { tenant_id: String, limit: String },
+    RateLimited { function_id: String, retry_after_seconds: u64 },
+    RuntimeUnavailable { runtime_id: String },
+    InvocationFailed { invocation_id: String, reason: String },
+    Internal { message: String },
+}
+```
+
+Layer 2 — `SlessOrchestratorError` (SDK `errors.rs`):
+Transport-agnostic errors exposed to consumers via the SDK. These map 1:1 to the GTS error type hierarchy defined in section 3.1.
+
+```rust
+#[derive(Error, Debug, Clone)]
+pub enum SlessOrchestratorError {
+    #[error("Function not found: {id}")]
+    NotFound { id: String },
+
+    #[error("Function not active: {id} (status: {status})")]
+    NotActive { id: String, status: String },
+
+    #[error("Validation failed")]
+    Validation { issues: Vec<ValidationIssue> },
+
+    #[error("Quota exceeded for tenant {tenant_id}")]
+    QuotaExceeded { tenant_id: String },
+
+    #[error("Rate limited: retry after {retry_after_seconds}s")]
+    RateLimited { function_id: String, retry_after_seconds: u64 },
+
+    #[error("Execution timed out: {invocation_id}")]
+    RuntimeTimeout { invocation_id: String },
+
+    #[error("Sync invocation reached suspension point")]
+    SyncSuspension { invocation_id: String },
+
+    #[error("Internal error")]
+    Internal,
+}
+```
+
+Layer 3 — `Problem` (in `api/rest/error.rs`):
+HTTP-specific error responses using RFC 9457 Problem Details. Converted from `SlessOrchestratorError`:
+
+```rust
+impl From<SlessOrchestratorError> for Problem {
+    fn from(e: SlessOrchestratorError) -> Self {
+        match e {
+            SlessOrchestratorError::NotFound { id } => Problem::not_found()
+                .with_type_uri("gts://gts.x.core.sless.err.v1~x.core.sless.err.not_found.v1~")
+                .with_detail(format!("Function not found: {id}")),
+            SlessOrchestratorError::RateLimited { retry_after_seconds, .. } => Problem::too_many_requests()
+                .with_type_uri("gts://gts.x.core.sless.err.v1~x.core.sless.err.rate_limited.v1~")
+                .with_header("Retry-After", retry_after_seconds),
+            // ... remaining variants
+        }
+    }
+}
+```
+
+**`sless-runtime` errors:**
+
+The runtime module has a simpler error hierarchy since it has no DB or complex domain logic:
+
+```rust
+#[derive(Error, Debug, Clone)]
+pub enum SlessRuntimeError {
+    #[error("Execution failed: {reason}")]
+    ExecutionFailed { reason: String },
+
+    #[error("Execution timed out after {timeout_seconds}s")]
+    Timeout { timeout_seconds: u64 },
+
+    #[error("Adapter not found: {adapter_id}")]
+    AdapterNotFound { adapter_id: String },
+
+    #[error("Adapter unavailable: {adapter_id}")]
+    AdapterUnavailable { adapter_id: String },
+
+    #[error("Internal error")]
+    Internal,
+}
+```
+
+The domain service converts `DomainError` to the SDK error at the domain boundary. Handlers convert SDK errors to `Problem` at the API boundary. This follows the same pattern as `mini-chat` (see `modules/mini-chat/mini-chat/src/api/rest/error.rs`).
+
+#### 1.4.5 Job Transport Abstraction
+
+The orchestrator does not call `SlessRuntimeClient` directly. Instead, the domain layer codes against a **`JobTransport`** trait that abstracts how jobs are dispatched to runtime instances. This allows the transport mechanism to be swapped without changing orchestration logic.
+
+**Trait definition** (`domain/transport.rs`):
+
+```rust
+/// Outcome of dispatching a job to a runtime instance.
+pub enum DispatchOutcome {
+    /// The runtime executed the job synchronously and returned a result.
+    Completed(ExecuteResult),
+    /// The runtime accepted the job for async execution.
+    /// The orchestrator will receive status/checkpoint callbacks
+    /// via SlessOrchestratorClient.
+    Accepted {
+        runtime_instance_id: String,
+    },
+}
+
+/// Abstraction over how the orchestrator sends jobs to runtime instances.
+/// Implementations handle instance selection, load balancing, and transport.
+#[async_trait]
+pub trait JobTransport: Send + Sync {
+    /// Dispatch a job for synchronous execution.
+    /// Blocks until the runtime returns a result or times out.
+    async fn dispatch_sync(
+        &self,
+        ctx: &SecurityContext,
+        job: &Job,
+        req: ExecuteRequest,
+    ) -> Result<DispatchOutcome, TransportError>;
+
+    /// Dispatch a job for asynchronous execution.
+    /// Returns immediately once the runtime acknowledges receipt.
+    async fn dispatch_async(
+        &self,
+        ctx: &SecurityContext,
+        job: &Job,
+        req: ExecuteRequest,
+    ) -> Result<DispatchOutcome, TransportError>;
+
+    /// Cancel an in-flight job on the runtime.
+    async fn cancel(
+        &self,
+        ctx: &SecurityContext,
+        job: &Job,
+    ) -> Result<(), TransportError>;
+
+    /// List available runtime instances and their health status.
+    async fn available_instances(&self) -> Result<Vec<RuntimeInstance>, TransportError>;
+}
+
+#[derive(Error, Debug)]
+pub enum TransportError {
+    #[error("No runtime instances available")]
+    NoInstancesAvailable,
+
+    #[error("Runtime instance {instance_id} unreachable")]
+    InstanceUnreachable { instance_id: String },
+
+    #[error("Dispatch timed out after {timeout_seconds}s")]
+    Timeout { timeout_seconds: u64 },
+
+    #[error("Runtime rejected job: {reason}")]
+    Rejected { reason: String },
+
+    #[error("Transport error: {0}")]
+    Internal(#[from] anyhow::Error),
+}
+```
+
+**v1 implementation — `DirectClientTransport`** (`infra/transport/direct.rs`):
+
+The initial implementation dispatches jobs via direct REST/gRPC calls using `SlessRuntimeClient` through `ClientHub`, with instance selection via `DirectoryService`:
+
+```rust
+pub struct DirectClientTransport {
+    hub: Arc<ClientHub>,
+    directory: Arc<dyn DirectoryClient>,
+    strategy: SelectionStrategy,
+}
+
+pub enum SelectionStrategy {
+    RoundRobin,
+    LeastLoaded,
+}
+
+#[async_trait]
+impl JobTransport for DirectClientTransport {
+    async fn dispatch_sync(
+        &self,
+        ctx: &SecurityContext,
+        job: &Job,
+        req: ExecuteRequest,
+    ) -> Result<DispatchOutcome, TransportError> {
+        let instance = self.select_instance().await?;
+        let client = self.hub.get_scoped::<dyn SlessRuntimeClient>(
+            &ClientScope::ByEndpoint(&instance.endpoint_uri),
+        )?;
+
+        let result = client.execute(ctx, req).await
+            .map_err(|e| TransportError::InstanceUnreachable {
+                instance_id: instance.instance_id.clone(),
+            })?;
+
+        Ok(DispatchOutcome::Completed(result))
+    }
+
+    async fn dispatch_async(
+        &self,
+        ctx: &SecurityContext,
+        job: &Job,
+        req: ExecuteRequest,
+    ) -> Result<DispatchOutcome, TransportError> {
+        let instance = self.select_instance().await?;
+        let client = self.hub.get_scoped::<dyn SlessRuntimeClient>(
+            &ClientScope::ByEndpoint(&instance.endpoint_uri),
+        )?;
+
+        // Fire-and-forget — runtime will callback via SlessOrchestratorClient
+        tokio::spawn({
+            let ctx = ctx.clone();
+            async move { client.execute(&ctx, req).await }
+        });
+
+        Ok(DispatchOutcome::Accepted {
+            runtime_instance_id: instance.instance_id,
+        })
+    }
+
+    async fn cancel(&self, ctx: &SecurityContext, job: &Job) -> Result<(), TransportError> {
+        // Resolve the instance that is running this job (stored on the invocation record)
+        // and call SlessRuntimeClient::cancel()
+        todo!()
+    }
+
+    async fn available_instances(&self) -> Result<Vec<RuntimeInstance>, TransportError> {
+        let instances = self.directory
+            .list_instances("sless-runtime").await
+            .map_err(|e| TransportError::Internal(e.into()))?;
+        Ok(instances.into_iter().map(RuntimeInstance::from).collect())
+    }
+}
+```
+
+**Instance selection** uses `DirectoryService::ListInstances("sless-runtime")` to discover available runtime instances, then applies the configured `SelectionStrategy`. The orchestrator stores the selected `runtime_instance_id` on the invocation record so that cancellation and status correlation can target the correct instance.
+
+**Failure handling:** If `dispatch_sync` or `dispatch_async` returns `TransportError::InstanceUnreachable`, the job worker marks the job for retry and selects a different instance on the next attempt. The orchestrator's timeout reaper catches jobs where the runtime accepted work but never called back (runtime crash mid-execution).
+
+**Error mapping:** `TransportError` is converted to `DomainError` at the domain service boundary:
+
+| `TransportError` | `DomainError` | Retryable? |
+|---|---|---|
+| `NoInstancesAvailable` | `RuntimeUnavailable` | Yes — job stays `queued`, retried on next poll |
+| `InstanceUnreachable { instance_id }` | `RuntimeUnavailable` | Yes — retry with different instance |
+| `Timeout { .. }` | `InvocationFailed { reason: "transport timeout" }` | Depends on `RetryPolicy` |
+| `Rejected { reason }` | `InvocationFailed { reason }` | No — permanent failure |
+| `Internal(..)` | `Internal` | No |
+
+**Future transport implementations:**
+
+| Implementation | Transport | When to adopt |
+|---|---|---|
+| `DirectClientTransport` (v1) | REST/gRPC via ClientHub | Default — works with current ModKit |
+| `NatsJobTransport` | NATS pub/sub with competing consumers | When throughput requires work distribution queues |
+| `StreamingGrpcTransport` | Bidirectional gRPC streaming (runtime pulls work) | When backpressure and connection-level flow control are needed |
+
+New transport implementations are wired via module configuration — no changes to the orchestrator's domain layer:
+
+```rust
+// In module.rs, during initialization:
+let transport: Arc<dyn JobTransport> = match config.transport.kind.as_str() {
+    "direct" => Arc::new(DirectClientTransport::new(hub, directory, config.transport.strategy)),
+    // Future:
+    // "nats" => Arc::new(NatsJobTransport::new(nats_conn, config.transport.nats)),
+    // "grpc-stream" => Arc::new(StreamingGrpcTransport::new(hub, config.transport.stream)),
+    other => anyhow::bail!("Unknown transport kind: {other}"),
+};
+```
+
+#### 1.4.6 Module Lifecycle
+
+**`sless-orchestrator`** — stateful, with background workers:
+
+```rust
+#[modkit::module(
+    name = "sless-orchestrator",
+    deps = ["types-registry", "authz-resolver", "sless-runtime"],
+    capabilities = [db, rest, stateful],
+    lifecycle(entry = "serve", stop_timeout = "30s", await_ready)
+)]
+pub struct SlessOrchestratorModule {
+    service: OnceLock<Arc<AppServices>>,
+    worker_cancel: Mutex<Option<CancellationToken>>,
+    worker_handles: Mutex<Option<WorkerHandles>>,
+}
+```
+
+Lifecycle integration:
+- The `serve` entry task runs the **Job Worker** polling loop — acquiring a distributed advisory lock, polling queued invocations, dispatching to runtime instances via the `JobTransport` trait (see [1.4.5](#145-job-transport-abstraction)), processing status transitions, and running the Scheduler and Event Trigger Engine as background workers.
+- `CancellationToken` is propagated to all background workers (job worker, scheduler, trigger engine). When the module receives a stop signal, the token is canceled, which:
+  1. Stops accepting new invocations.
+  2. Signals in-flight sync invocations to return a cancellation error.
+  3. Allows in-flight async invocations a grace period (`stop_timeout = "30s"`) to checkpoint and transition to `suspended` status before forced termination.
+- `await_ready` ensures the module's REST routes are not registered until the orchestrator is initialized and runtime connectivity is confirmed.
+
+**`sless-runtime`** — stateless, no background workers:
+
+```rust
+#[modkit::module(
+    name = "sless-runtime",
+    deps = ["types-registry"],
+    capabilities = [rest],
+    lifecycle(entry = "serve", stop_timeout = "10s")
+)]
+pub struct SlessRuntimeModule {
+    executor_pool: OnceLock<Arc<ExecutorPool>>,
+}
+```
+
+The runtime's `serve` entry initializes the executor pool and adapter plugins. On shutdown, `stop_timeout = "10s"` gives in-flight executions time to return partial results. The runtime has no DB, no advisory locks, and no background polling — it is purely reactive.
+
+#### 1.4.7 Database Access and Tenant Isolation
+
+All database access in `sless-orchestrator` goes through `SecureConn` with `AccessScope::for_tenant(tenant_id)`. This enforces row-level tenant isolation at the ORM layer, consistent with the platform security model. (`sless-runtime` has no database.)
+
+**Entity requirements:**
+All SeaORM entities must derive `Scopable` with `#[secure(tenant_col = "tenant_id")]`:
+
+```rust
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Scopable)]
+#[sea_orm(table_name = "functions")]
+#[secure(
+    tenant_col = "tenant_id",
+    resource_col = "function_id",
+    no_owner,
+    no_type
+)]
+pub struct Model {
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub function_id: String,
+    pub tenant_id: String,
+    pub version: String,
+    pub status: String,
+    // ...
+}
+```
+
+This applies to all entities in `sless-orchestrator`: `functions`, `workflows`, `invocations`, `invocation_timeline`, `checkpoints`, `schedules`, `event_triggers`, `webhook_triggers`, and `tenant_policies`.
+
+**Cross-tenant sharing** (e.g., system-scoped functions visible to all tenants) must use `AccessScope` elevation, not raw queries that bypass `SecureConn`. The `OwnerRef.owner_type = "system"` case is handled via an elevated `AccessScope` that includes the system tenant scope alongside the requesting tenant's scope.
+
 ## 2. Principles & Constraints
 
 ### 2.1 Design Principles
@@ -187,6 +787,206 @@ Workflow DSL syntax details are implementation-specific and defined per executor
 - [ ] `p2` - **ID**: `cpt-cf-serverless-runtime-constraint-no-ui-ux`
 
 UI/UX for authoring or debugging workflows is out of scope for this design document.
+
+### 2.3 Industry Comparison and Capability Allocation
+
+This design draws from several industry workflow/serverless platforms. This section maps their capabilities to our architecture and clarifies what the **orchestrator core** provides vs what is delegated to **runtime adapters**.
+
+#### Industry Reference Points
+
+| Platform | Architecture Model | Key Insight for This Design |
+|---|---|---|
+| **Temporal** | Workflows + Activities as peers; deterministic replay; task queues with competing workers | Validates sibling type hierarchy. Replay, step model, and task queues are Temporal-specific — a Temporal adapter would expose these natively. |
+| **Azure Durable Functions** | Orchestrator functions + activity functions; replay-based; built on Azure Storage queues | Replay is runtime-specific. The "orchestrator function" pattern maps to our workflow type. |
+| **AWS Step Functions** | State machine DSL (ASL); states = steps; parallel/choice/wait built into DSL | Step/state model is DSL-specific. Parallel, choice, and wait are all expressible within the adapter's workflow spec. |
+| **AWS Lambda** | Stateless functions; event-driven; no built-in orchestration | Maps directly to our function type with a Lambda adapter. |
+
+#### What the Orchestrator Core Provides
+
+The orchestrator owns capabilities that must be **consistent across all adapters** — the "platform guarantees" that hold regardless of which runtime executes the work:
+
+| Capability | Orchestrator Responsibility | PRD Reference |
+|---|---|---|
+| **Job lifecycle** | Queued → running → completed/failed/canceled state machine, atomic transitions | BR-005, BR-014 |
+| **Retry policy** | Exponential backoff, max attempts, non-retryable error classification | BR-019 |
+| **Function-level compensation** | Invoke `on_failure`/`on_cancel` handlers when a workflow fails or is canceled | BR-133 |
+| **Checkpoint persistence** | Store checkpoint data reported by the runtime; resume from last checkpoint on retry | BR-009 |
+| **Timeout enforcement** | Kill invocations exceeding `timeout_seconds`; timeout reaper for silent runtime failures | BR-028 |
+| **Scheduling & triggers** | Cron/interval schedules, event triggers, webhook triggers — all create invocation jobs | BR-007, BR-022 |
+| **Invocation history & timeline** | Record timeline events for every state transition and step boundary | BR-015, BR-130 |
+| **Tenant isolation & quotas** | Per-tenant concurrency limits, rate limiting, policy enforcement | BR-012, BR-106 |
+| **Idempotency** | Deduplication via `Idempotency-Key` header and tenant-scoped deduplication window | BR-134 |
+| **Version pinning** | In-flight executions pinned to exact function version at start time | BR-029 |
+
+#### What Runtime Adapters Provide
+
+Adapters own capabilities that are **inherently runtime-specific** — different execution engines express these differently or not at all:
+
+| Capability | Adapter Responsibility | Industry Precedent | PRD Reference |
+|---|---|---|---|
+| **Step/activity abstraction** | Define what a "step" is and how steps compose. Temporal has Activities; Step Functions has States; Starlark has function calls. | Temporal Activities, ASL States | BR-104 |
+| **Parallel execution** | Fan-out/fan-in within a workflow. Temporal uses `workflow.Go()`; Step Functions uses `Parallel` state. Adapters that support parallelism spawn multiple `ctx.invoke()` calls concurrently. Starlark v1 is sequential only. | Temporal goroutines, ASL Parallel | BR-105 |
+| **Event waiting / signals** | Suspend execution waiting for an external event. Temporal uses Signals; Step Functions uses `.waitForTaskToken`; a Starlark adapter could expose `ctx.wait_for_event()`. | Temporal Signals, ASL WaitForTaskToken | BR-108 |
+| **Deterministic replay** | Replay execution from event history for fault tolerance. This is a Temporal/Durable Functions concept — not all runtimes need or support it. | Temporal, Azure Durable Functions | — |
+| **Step-level compensation** | Per-step rollback in reverse order. Adapter-specific; the orchestrator provides function-level compensation as a universal safety net. | Temporal Saga, custom | BR-133 |
+| **Sub-workflow invocation** | Calling a child workflow from a parent. The adapter invokes child callables via `SlessOrchestratorClient::invoke()`, which routes through the full orchestrator lifecycle. | Temporal Child Workflows, ASL nested state machines | BR-104 |
+| **Per-step timeouts** | Timeout individual steps within a workflow. The orchestrator enforces the overall `timeout_seconds` (BR-028); adapters enforce step-level timeouts internally. For managed adapters, each `ctx.invoke()` call creates a child invocation with its own `timeout_seconds` from the child function's definition — so per-step timeout is achieved via per-callable timeout. Adapters with native step models (Temporal activities, ASL states) use their own timeout machinery. | Temporal Activity timeouts, ASL TimeoutSeconds per state | BR-028 (overall) |
+| **Conditional branching** | If/else, switch, choice within a workflow. Imperative runtimes (Starlark, Temporal) use native language `if/else`; declarative runtimes define choice states in their workflow spec (e.g., Serverless Workflow `switch` state). No core abstraction needed — this is inherently part of the adapter's execution model and workflow DSL. | ASL Choice, native code | — |
+| **Task queue / worker model** | Work distribution to adapter-specific worker pools. Temporal has task queues; a Starlark adapter uses the `sless-runtime` executor pool directly. | Temporal Task Queues | — |
+| **Workflow DSL** | The authoring language and format. Starlark scripts, YAML specs, Temporal Go/Python SDK, etc. | Per-runtime | Constraint 2.2 |
+
+#### The Adapter Contract
+
+The runtime adapter contract has two parts: the **`RuntimeAdapter` trait** that the adapter implements, and the **`ExecutionContext`** that the orchestrator provides to the adapter during execution.
+
+##### RuntimeAdapter Trait
+
+Every adapter implements this trait:
+
+```rust
+#[async_trait]
+pub trait RuntimeAdapter: Send + Sync {
+    /// Execute a callable with access to host context for orchestrator callbacks.
+    async fn execute(
+        &self,
+        ctx: &dyn ExecutionContext,
+        req: ExecuteRequest,
+    ) -> Result<ExecuteResult, SlessRuntimeError>;
+
+    /// Cancel an in-flight execution.
+    async fn cancel(&self, execution_id: &str) -> Result<(), SlessRuntimeError>;
+
+    /// Handle an adapter-specific control action (via :adapter-control endpoint).
+    /// Only called for actions listed in capabilities().control_actions.
+    async fn handle_control_action(
+        &self,
+        execution_id: &str,
+        action: &str,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, SlessRuntimeError>;
+
+    /// Declare what this adapter supports.
+    fn capabilities(&self) -> AdapterCapabilities;
+}
+```
+
+##### ExecutionContext — Host Callbacks
+
+The orchestrator provides this context to adapters during execution. Adapters call these methods to interact with the orchestrator for side effects that require durability or cross-invocation coordination. Simple adapters (Starlark, Lambda) may ignore the context entirely. Workflow adapters (Serverless Workflow, custom engines) lean on it heavily. Autonomous adapters (Temporal) may bypass it in favor of their own infrastructure.
+
+```rust
+#[async_trait]
+pub trait ExecutionContext: Send + Sync {
+    /// Invoke a child callable through the full orchestrator lifecycle.
+    /// `callable_id` can reference either a Function or a Workflow —
+    /// both resolve through the orchestrator's invocation stack with
+    /// their own retry, timeout, and compensation.
+    /// Blocks until child completes.
+    ///
+    /// For parallel execution, adapters spawn multiple invoke() calls
+    /// concurrently using standard async patterns:
+    ///
+    ///   let (a, b) = tokio::join!(
+    ///       ctx.invoke("fn_a", params_a),
+    ///       ctx.invoke("fn_b", params_b),
+    ///   );
+    ///
+    async fn invoke(
+        &self,
+        callable_id: &str,
+        params: serde_json::Value,
+    ) -> Result<InvocationResult, ContextError>;
+
+    /// Persist a checkpoint. On retry/recovery, the adapter receives the
+    /// last checkpoint in ExecuteRequest.last_checkpoint.
+    async fn checkpoint(
+        &self,
+        state: serde_json::Value,
+    ) -> Result<(), ContextError>;
+
+    /// Suspend execution waiting for an external event matching the filter.
+    /// The orchestrator persists the suspended state and resumes the adapter
+    /// (by re-calling execute with the event data in last_checkpoint) when
+    /// a matching event arrives via :adapter-control or trigger.
+    async fn wait_for_event(
+        &self,
+        filter: EventFilter,
+    ) -> Result<serde_json::Value, ContextError>;
+
+    /// Suspend execution for a duration (durable timer).
+    /// The orchestrator persists the timer and resumes after expiry.
+    async fn sleep(&self, duration: Duration) -> Result<(), ContextError>;
+
+    /// Report a timeline event for observability. The orchestrator stores
+    /// these in the invocation timeline and serves them via the timeline API.
+    async fn report_event(
+        &self,
+        event: TimelineEvent,
+    ) -> Result<(), ContextError>;
+}
+```
+
+**Usage by adapter type:**
+
+| Adapter Type | `invoke` | `checkpoint` | `wait_for_event` | `sleep` | `report_event` | `handle_control_action` |
+|---|---|---|---|---|---|---|
+| **Starlark** (simple function) | — | — | — | — | — | — |
+| **Serverless Workflow 1.0** (declarative engine) | child function/workflow calls | after each state transition | event-waiting states | sleep states | state entry/exit events | `send-event`, `get-state` |
+| **Custom Rust workflow engine** | composition calls | after each step | signal/event waiting | timers | step-level tracing | engine-specific actions |
+| **Temporal** (autonomous) | — (uses own SDK) | — (own event sourcing) | — (own signals) | — (own timers) | step boundaries for timeline | `signal`, `query`, `reset` |
+
+##### Capability Declaration
+
+Adapters declare their capabilities via `AdapterCapabilities`. The orchestrator uses this for:
+- **Registration-time validation** — reject workflows that require capabilities the adapter doesn't support
+- **API discovery** — populate `adapter_capabilities` in the invocation response so clients know what actions are available
+- **`:adapter-control` validation** — reject unsupported actions before forwarding to the adapter
+
+```rust
+pub struct AdapterCapabilities {
+    /// Adapter-specific control actions (e.g., "signal", "query").
+    pub control_actions: Vec<ControlActionSpec>,
+    /// Whether the adapter supports parallel execution within workflows.
+    pub parallel: bool,
+    /// Whether the adapter supports event waiting / signals.
+    pub event_waiting: bool,
+    /// Whether the adapter supports deterministic replay.
+    pub replay: bool,
+    /// Whether the adapter supports step-level compensation.
+    pub step_compensation: bool,
+    /// Whether the adapter manages its own execution lifecycle (autonomous).
+    /// When true, the orchestrator acts as a thin proxy and does not manage
+    /// retry, timeout, or checkpoint storage for this adapter.
+    pub autonomous: bool,
+}
+
+pub struct ControlActionSpec {
+    /// Action name (used in the :adapter-control request body).
+    pub name: String,
+    /// Human-readable description.
+    pub description: String,
+    /// JSON Schema for the expected payload (for client-side validation/discovery).
+    pub payload_schema: Option<serde_json::Value>,
+    /// Valid invocation states from which this action can be called.
+    pub valid_from_states: Vec<InvocationStatus>,
+}
+```
+
+The `autonomous` flag is the key differentiator: when `true`, the orchestrator delegates the full execution lifecycle to the adapter and only mirrors status. When `false`, the orchestrator manages retry, timeout, and checkpoint storage using the `ExecutionContext` callbacks.
+
+#### Implications for PRD Feature Coverage
+
+| PRD Feature | Covered By | Notes |
+|---|---|---|
+| Parallel execution (BR-105) | Runtime adapter | Adapter uses `ctx.invoke()` concurrently or manages parallelism internally. Orchestrator validates adapter declares `parallel: true` at registration time. |
+| Event waiting (BR-108) | Runtime adapter via `ctx.wait_for_event()` + orchestrator `suspended` state + `:adapter-control` for event delivery | Adapter suspends; orchestrator persists state; external events arrive via `:adapter-control` `send-event` action or trigger, and orchestrator resumes the adapter. |
+| Sub-workflow (BR-104) | Runtime adapter via `ctx.invoke()` | Child invocations are full orchestrator-managed jobs with their own lifecycle, retry, and compensation. |
+| Per-step timeout (BR-028) | Both — overall timeout (orchestrator), step-level (adapter) | Orchestrator enforces `timeout_seconds` on the invocation. For managed adapters, each `ctx.invoke()` child has its own timeout from its function definition. Autonomous adapters (Temporal) use native activity/step timeouts. |
+| Compensation (BR-133) | Both — function-level (orchestrator), step-level (adapter) | Two-layer model already documented in section 3.1. |
+| Replay (BR-124) | Runtime adapter + orchestrator timeline | Orchestrator provides timeline event history via `report_event()`; adapter implements deterministic replay if supported (declared via `replay: true`). |
+| Visualization (BR-125) | Orchestrator timeline API | Timeline events are adapter-reported via `ctx.report_event()` but stored and served by the orchestrator. Works for all adapters. |
+
+This allocation means the orchestrator can ship with a simple adapter (e.g., Starlark for sequential function chains) while the full workflow orchestration feature set (parallel, signals, replay) is unlocked by plugging in a capable adapter like Temporal or a Serverless Workflow 1.0 engine. The PRD features are achievable — they are allocated to the right layer rather than forced into the core.
 
 ## 3. Technical Architecture
 
@@ -1694,7 +2494,7 @@ Manages the lifecycle of function definitions (functions and workflows), includi
 
 ##### Why this component exists
 
-Handles the invocation lifecycle: accepting invocation requests, dispatching to executors, managing status transitions, and returning results.
+Handles the invocation lifecycle: accepting invocation requests, forwarding to `sless-runtime` for execution, managing status transitions, and returning results.
 
 ##### Responsibility scope
 
@@ -2242,11 +3042,12 @@ Soft-deletes a function. Retained for audit purposes.
 | `POST` | `/api/serverless-runtime/v1/invocations` | Start invocation |
 | `GET` | `/api/serverless-runtime/v1/invocations` | List invocations |
 | `GET` | `/api/serverless-runtime/v1/invocations/{invocation_id}` | Get status |
-| `POST` | `/api/serverless-runtime/v1/invocations/{invocation_id}:control` | Control invocation lifecycle |
+| `POST` | `/api/serverless-runtime/v1/invocations/{invocation_id}:control` | Control invocation lifecycle (generic) |
+| `POST` | `/api/serverless-runtime/v1/invocations/{invocation_id}:adapter-control` | Adapter-specific control actions (passthrough) |
 
-##### Invocation Control Actions
+##### Invocation Control Actions (Generic)
 
-The `:control` endpoint accepts a JSON body with `action` field:
+The `:control` endpoint handles **platform-level lifecycle actions** that work across all adapters. The orchestrator executes these directly — they never reach the adapter.
 
 ```json
 {
@@ -2263,6 +3064,54 @@ Valid actions and state requirements:
 | `resume` | Resume a suspended invocation | `suspended` |
 | `retry` | Retry a failed invocation with same parameters | `failed` |
 | `replay` | Create new invocation from completed one's params | `succeeded`, `failed` |
+
+##### Adapter Control Actions (Passthrough)
+
+The `:adapter-control` endpoint handles **runtime-specific actions** that are defined and implemented by individual adapters. The orchestrator acts as a secure proxy:
+
+1. Authenticates the caller and verifies tenant ownership of the invocation
+2. Looks up which adapter is executing this invocation
+3. Validates the action is in the adapter's declared `control_actions` capability set
+4. Forwards the action and payload to the adapter via the `RuntimeAdapter` trait
+5. Returns the adapter's response to the caller
+
+```json
+{
+  "action": "signal",
+  "payload": {
+    "signal_name": "approval_received",
+    "data": { "approved_by": "user_42", "amount": 5000 }
+  }
+}
+```
+
+**Response:** The adapter returns an opaque JSON result. The orchestrator wraps it in a standard envelope:
+
+```json
+{
+  "invocation_id": "inv_abc123",
+  "adapter": "gts.x.core.sless.runtime.temporal.v1~",
+  "action": "signal",
+  "result": { "delivered": true }
+}
+```
+
+**Action discovery:** Clients discover available adapter actions via `GET /invocations/{id}` — the response includes an `adapter_capabilities.control_actions` array listing the actions the adapter supports for this invocation. This is populated from the adapter's `AdapterCapabilities` declaration.
+
+**Example adapter actions by runtime:**
+
+| Adapter | Action | Payload | Description |
+|---|---|---|---|
+| Temporal | `signal` | `{ "signal_name": "...", "data": {...} }` | Send a Temporal signal to a running workflow |
+| Temporal | `query` | `{ "query_type": "...", "args": {...} }` | Query workflow state without side effects |
+| Temporal | `reset` | `{ "event_id": 42 }` | Reset workflow to a specific event in history |
+| Serverless Workflow | `send-event` | `{ "event_type": "...", "data": {...} }` | Deliver an event to a workflow in an event-waiting state |
+| Serverless Workflow | `get-state` | `{}` | Return current state machine position and data |
+| Starlark | _(none)_ | — | Simple executor, no adapter-specific actions |
+
+**Error handling:** If the adapter does not support the requested action, the orchestrator returns `422 Unprocessable Entity` with error type `gts.x.core.sless.err.v1~x.core.sless.err.unsupported_action.v1~` without forwarding to the adapter. If the adapter returns an error, the orchestrator wraps it in an RFC 9457 Problem response with the adapter's error detail preserved.
+
+See [The Adapter Contract (section 2.3)](#the-adapter-contract) for the full `RuntimeAdapter` trait, `ExecutionContext` host callbacks, `AdapterCapabilities`, and `ControlActionSpec` definitions.
 
 ##### Start Invocation Request
 
@@ -3059,8 +3908,8 @@ The invocation flow follows the state machine defined in the InvocationStatus se
 3. If `dry_run: true`, return synthetic result without persisting
 4. If response caching is active and cache hit, return cached result
 5. Create `InvocationRecord` in `queued` status
-6. For `sync` mode: dispatch to executor, wait for result, return in response
-7. For `async` mode: return `invocation_id` immediately, dispatch to executor asynchronously
+6. For `sync` mode: forward to `sless-runtime`, wait for result, return in response
+7. For `async` mode: return `invocation_id` immediately, forward to `sless-runtime` asynchronously
 8. Executor runs function code, reports status transitions
 9. On success: transition to `succeeded`, populate result
 10. On failure: evaluate retry policy, retry or transition to `failed`
