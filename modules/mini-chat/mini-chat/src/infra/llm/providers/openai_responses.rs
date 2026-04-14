@@ -1,4 +1,4 @@
-// Updated: 2026-04-07 by Constructor Tech
+// Updated: 2026-04-14 by Constructor Tech
 //! `OpenAI` Responses API adapter (`/v1/responses`).
 //!
 //! Implements [`LlmProvider`] by converting [`LlmRequest`] to the Responses
@@ -59,7 +59,7 @@ pub(super) enum ProviderEvent {
         error: ProviderErrorPayload,
     },
     ResponseIncomplete {
-        reason: String,
+        response: ResponseObject,
     },
     Unknown {
         #[allow(dead_code)]
@@ -78,6 +78,15 @@ pub struct ResponseObject {
     #[serde(default)]
     pub output: Vec<OutputItem>,
     pub usage: RawUsage,
+    #[serde(default)]
+    pub incomplete_details: Option<IncompleteDetails>,
+}
+
+/// Details returned when a response finishes with status `"incomplete"`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IncompleteDetails {
+    #[serde(default)]
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -256,8 +265,7 @@ struct ResponseFailedData {
 
 #[derive(Deserialize)]
 struct ResponseIncompleteData {
-    #[serde(default)]
-    reason: String,
+    response: ResponseObject,
 }
 
 /// A single output item from `response.code_interpreter_call.completed`.
@@ -389,7 +397,7 @@ impl FromServerEvent for ProviderEvent {
                         }
                     })?;
                 Ok(ProviderEvent::ResponseIncomplete {
-                    reason: data.reason,
+                    response: data.response,
                 })
             }
 
@@ -522,16 +530,15 @@ pub(super) fn translate_provider_event(
             })
         }
 
-        ProviderEvent::ResponseIncomplete { reason } => {
+        ProviderEvent::ResponseIncomplete { response } => {
+            let reason = response
+                .incomplete_details
+                .as_ref()
+                .map_or_else(String::new, |d| d.reason.clone());
+            let usage = response.usage.to_usage();
             TranslatedEvent::Terminal(TerminalOutcome::Incomplete {
-                reason: reason.clone(),
-                usage: Usage {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cache_read_input_tokens: 0,
-                    cache_write_input_tokens: 0,
-                    reasoning_tokens: 0,
-                },
+                reason,
+                usage,
                 partial_content: accumulated_text.to_owned(),
             })
         }
@@ -731,6 +738,17 @@ fn build_request_body<M>(request: &LlmRequest<M>, stream: bool) -> serde_json::V
         for (k, v) in extra_obj {
             body_obj.insert(k.clone(), v.clone());
         }
+    }
+
+    // Responses API uses `reasoning: { effort: "..." }` instead of the
+    // top-level `reasoning_effort` key used by Chat Completions.
+    if let Some(body_obj) = body.as_object_mut()
+        && let Some(effort) = body_obj.remove("reasoning_effort")
+    {
+        body_obj.insert(
+            "reasoning".to_owned(),
+            serde_json::json!({ "effort": effort }),
+        );
     }
 
     body

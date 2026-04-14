@@ -1,4 +1,4 @@
-// Updated: 2026-04-07 by Constructor Tech
+// Updated: 2026-04-14 by Constructor Tech
 //! Service implementation for the static `AuthZ` resolver plugin.
 
 use authz_resolver_sdk::{
@@ -45,7 +45,7 @@ impl Service {
             });
 
         let Some(tid) = tenant_id else {
-            // No tenant resolvable from context or subject — deny access.
+            // No tenant resolvable from context or subject - deny access.
             return EvaluationResponse {
                 decision: false,
                 context: EvaluationResponseContext::default(),
@@ -53,7 +53,7 @@ impl Service {
         };
 
         if tid == Uuid::default() {
-            // Nil UUID tenant — deny rather than grant unrestricted access.
+            // Nil UUID tenant - deny rather than grant unrestricted access.
             return EvaluationResponse {
                 decision: false,
                 context: EvaluationResponseContext::default(),
@@ -76,6 +76,5 @@ impl Service {
 }
 
 #[cfg(test)]
-#[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "service_tests.rs"]
 mod service_tests;

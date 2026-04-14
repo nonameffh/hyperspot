@@ -1,4 +1,4 @@
-// Created: 2026-04-07 by Constructor Tech
+// Created: 2026-04-14 by Constructor Tech
 #![allow(clippy::str_to_string)]
 use super::*;
 use crate::domain::llm::WebSearchContextSize;
@@ -508,6 +508,44 @@ fn builder_function_tool_dropped() {
     assert!(body.get("tools").is_none());
 }
 
+#[test]
+fn builder_reasoning_effort_nested_under_reasoning() {
+    let request = llm_request("o3")
+        .message(LlmMessage::user("Think hard"))
+        .additional_params(serde_json::json!({
+            "temperature": 1.0,
+            "reasoning_effort": "high"
+        }))
+        .build_streaming();
+
+    let body = build_request_body(&request, true);
+
+    // Top-level key must be removed
+    assert!(
+        body.get("reasoning_effort").is_none(),
+        "reasoning_effort should not appear at top level"
+    );
+    // Must be nested as `reasoning.effort`
+    assert_eq!(body["reasoning"]["effort"], "high");
+    // Other additional_params are still top-level
+    assert_eq!(body["temperature"], 1.0);
+}
+
+#[test]
+fn builder_no_reasoning_key_when_effort_absent() {
+    let request = llm_request("gpt-4o")
+        .message(LlmMessage::user("Hello"))
+        .additional_params(serde_json::json!({
+            "temperature": 0.7
+        }))
+        .build_streaming();
+
+    let body = build_request_body(&request, true);
+
+    assert!(body.get("reasoning_effort").is_none());
+    assert!(body.get("reasoning").is_none());
+}
+
 // ── Unit tests: FromServerEvent ────────────────────────────────────────
 
 #[test]
@@ -650,12 +688,12 @@ fn parse_code_interpreter_completed_event_ignores_file_outputs() {
     let event = ServerEvent {
         event: Some("response.code_interpreter_call.completed".to_string()),
         data: r#"{
-            "outputs": [
-                {"type":"files","file_id":"file-abc"},
-                {"type":"logs","logs":"only this"},
-                {"type":"files","file_id":"file-def"}
-            ]
-        }"#
+                "outputs": [
+                    {"type":"files","file_id":"file-abc"},
+                    {"type":"logs","logs":"only this"},
+                    {"type":"files","file_id":"file-def"}
+                ]
+            }"#
         .to_string(),
         id: None,
         retry: None,
@@ -672,11 +710,11 @@ fn parse_code_interpreter_completed_event_ignores_file_outputs() {
 #[test]
 fn parse_response_completed_event() {
     let event = ServerEvent {
-        event: Some("response.completed".to_string()),
-        data: r#"{"response":{"id":"resp-abc","output":[{"type":"message","content":[{"type":"output_text","text":"Hello","annotations":[]}]}],"usage":{"input_tokens":100,"output_tokens":50}}}"#.to_string(),
-        id: None,
-        retry: None,
-    };
+            event: Some("response.completed".to_string()),
+            data: r#"{"response":{"id":"resp-abc","output":[{"type":"message","content":[{"type":"output_text","text":"Hello","annotations":[]}]}],"usage":{"input_tokens":100,"output_tokens":50}}}"#.to_string(),
+            id: None,
+            retry: None,
+        };
     let result = ProviderEvent::from_server_event(event).unwrap();
     match result {
         ProviderEvent::ResponseCompleted { response } => {
@@ -691,11 +729,11 @@ fn parse_response_completed_event() {
 #[test]
 fn parse_response_completed_with_token_details() {
     let event = ServerEvent {
-        event: Some("response.completed".to_string()),
-        data: r#"{"response":{"id":"resp-abc","output":[],"usage":{"input_tokens":800,"output_tokens":200,"input_tokens_details":{"cached_tokens":300},"output_tokens_details":{"reasoning_tokens":60}}}}"#.to_string(),
-        id: None,
-        retry: None,
-    };
+            event: Some("response.completed".to_string()),
+            data: r#"{"response":{"id":"resp-abc","output":[],"usage":{"input_tokens":800,"output_tokens":200,"input_tokens_details":{"cached_tokens":300},"output_tokens_details":{"reasoning_tokens":60}}}}"#.to_string(),
+            id: None,
+            retry: None,
+        };
     let result = ProviderEvent::from_server_event(event).unwrap();
     match result {
         ProviderEvent::ResponseCompleted { response } => {
@@ -743,15 +781,24 @@ fn parse_response_failed_event() {
 #[test]
 fn parse_response_incomplete_event() {
     let event = ServerEvent {
-        event: Some("response.incomplete".to_string()),
-        data: r#"{"reason":"max_output_tokens"}"#.to_string(),
-        id: None,
-        retry: None,
-    };
+            event: Some("response.incomplete".to_string()),
+            data: r#"{"response":{"id":"resp-inc","output":[],"usage":{"input_tokens":200,"output_tokens":4096},"incomplete_details":{"reason":"max_output_tokens"}}}"#.to_string(),
+            id: None,
+            retry: None,
+        };
     let result = ProviderEvent::from_server_event(event).unwrap();
-    assert!(
-        matches!(result, ProviderEvent::ResponseIncomplete { reason } if reason == "max_output_tokens")
-    );
+    match result {
+        ProviderEvent::ResponseIncomplete { response } => {
+            assert_eq!(response.id, "resp-inc");
+            assert_eq!(response.usage.input_tokens, 200);
+            assert_eq!(response.usage.output_tokens, 4096);
+            assert_eq!(
+                response.incomplete_details.as_ref().unwrap().reason,
+                "max_output_tokens"
+            );
+        }
+        _ => panic!("expected ResponseIncomplete"),
+    }
 }
 
 #[test]
@@ -925,6 +972,7 @@ fn translate_completed_returns_terminal() {
                 input_tokens_details: None,
                 output_tokens_details: None,
             },
+            incomplete_details: None,
         },
     };
     let translated = translate_provider_event(&event, "Hello");
@@ -958,6 +1006,7 @@ fn translate_completed_propagates_token_details() {
                     reasoning_tokens: 60,
                 }),
             },
+            incomplete_details: None,
         },
     };
     let translated = translate_provider_event(&event, "");
@@ -993,17 +1042,31 @@ fn translate_failed_returns_terminal() {
 #[test]
 fn translate_incomplete_returns_terminal() {
     let event = ProviderEvent::ResponseIncomplete {
-        reason: "max_output_tokens".into(),
+        response: ResponseObject {
+            id: "resp-inc".into(),
+            output: vec![],
+            usage: RawUsage {
+                input_tokens: 200,
+                output_tokens: 4096,
+                input_tokens_details: None,
+                output_tokens_details: None,
+            },
+            incomplete_details: Some(IncompleteDetails {
+                reason: "max_output_tokens".into(),
+            }),
+        },
     };
     let translated = translate_provider_event(&event, "partial");
     match translated {
         TranslatedEvent::Terminal(TerminalOutcome::Incomplete {
             reason,
+            usage,
             partial_content,
-            ..
         }) => {
             assert_eq!(reason, "max_output_tokens");
             assert_eq!(partial_content, "partial");
+            assert_eq!(usage.input_tokens, 200);
+            assert_eq!(usage.output_tokens, 4096);
         }
         _ => panic!("expected Terminal(Incomplete)"),
     }
@@ -1044,6 +1107,7 @@ fn extract_citations_file_citation() {
             input_tokens_details: None,
             output_tokens_details: None,
         },
+        incomplete_details: None,
     };
     let citations = extract_citations(&response, "");
     assert_eq!(citations.len(), 1);
@@ -1080,6 +1144,7 @@ fn extract_citations_url_citation() {
             input_tokens_details: None,
             output_tokens_details: None,
         },
+        incomplete_details: None,
     };
     let citations = extract_citations(&response, "");
     assert_eq!(citations.len(), 1);
@@ -1106,6 +1171,7 @@ fn extract_citations_empty_annotations() {
             input_tokens_details: None,
             output_tokens_details: None,
         },
+        incomplete_details: None,
     };
     let citations = extract_citations(&response, "");
     assert!(citations.is_empty());
@@ -1138,6 +1204,7 @@ fn extract_citations_url_citation_snippet_from_text_range() {
             input_tokens_details: None,
             output_tokens_details: None,
         },
+        incomplete_details: None,
     };
     let citations = extract_citations(&response, accumulated);
     assert_eq!(citations.len(), 1);
@@ -1170,6 +1237,7 @@ fn extract_citations_url_citation_snippet_from_annotation_text() {
             input_tokens_details: None,
             output_tokens_details: None,
         },
+        incomplete_details: None,
     };
     let citations = extract_citations(&response, "Hello world");
     assert_eq!(citations.len(), 1);
@@ -1202,6 +1270,7 @@ fn extract_citations_url_citation_no_text_no_indices() {
             input_tokens_details: None,
             output_tokens_details: None,
         },
+        incomplete_details: None,
     };
     let citations = extract_citations(&response, "Hello");
     assert_eq!(citations.len(), 1);

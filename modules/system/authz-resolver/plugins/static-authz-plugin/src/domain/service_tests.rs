@@ -1,4 +1,4 @@
-// Created: 2026-04-07 by Constructor Tech
+// Created: 2026-04-14 by Constructor Tech
 use super::*;
 use authz_resolver_sdk::pep::IntoPropertyValue;
 use authz_resolver_sdk::{Action, EvaluationRequestContext, Resource, Subject, TenantContext};
@@ -56,7 +56,7 @@ fn list_operation_with_tenant_context() {
             assert_eq!(in_pred.property, pep_properties::OWNER_TENANT_ID);
             assert_eq!(in_pred.values, vec![tenant_id.into_filter_value()]);
         }
-        other @ Predicate::Eq(_) => panic!("Expected In predicate, got: {other:?}"),
+        other => panic!("Expected In predicate, got: {other:?}"),
     }
 }
 
@@ -80,7 +80,7 @@ fn list_operation_without_tenant_falls_back_to_subject_properties() {
                 ]
             );
         }
-        other @ Predicate::Eq(_) => panic!("Expected In predicate, got: {other:?}"),
+        other => panic!("Expected In predicate, got: {other:?}"),
     }
 }
 

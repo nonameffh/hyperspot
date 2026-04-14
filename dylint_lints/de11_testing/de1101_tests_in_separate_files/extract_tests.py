@@ -83,7 +83,7 @@ def extract_test_body(lines, start, end):
 
 
 def has_coverage_attr(lines, start, end):
-    for i in range(start, min(start + 4, end)):
+    for i in range(start, min(start + 4, end + 1)):
         if "coverage" in lines[i]:
             return True
     return False
@@ -130,9 +130,12 @@ def process_file(fpath):
     with open(fpath, "w", encoding="utf-8") as f:
         f.write("\n".join(new_lines))
 
-    # Write test file
+    # Write test file — refuse to overwrite an existing companion file
     test_filepath = os.path.join(os.path.dirname(fpath), test_filename)
-    with open(test_filepath, "w", encoding="utf-8") as f:
+    if os.path.exists(test_filepath):
+        print(f"  SKIP {fpath}: {test_filename} already exists, not overwriting")
+        return False
+    with open(test_filepath, "x", encoding="utf-8") as f:
         f.write(test_content)
 
     print(f"  {fpath} -> {test_filename}")

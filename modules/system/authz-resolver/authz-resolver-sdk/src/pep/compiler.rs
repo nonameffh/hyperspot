@@ -1,4 +1,4 @@
-// Updated: 2026-04-07 by Constructor Tech
+// Updated: 2026-04-14 by Constructor Tech
 //! PEP constraint compiler.
 //!
 //! Compiles PDP evaluation responses into `AccessScope` for the secure ORM.
@@ -18,6 +18,15 @@
 //! `allow_all()` (legitimate PDP "yes, no row-level filtering"). When
 //! `require_constraints=true`, empty constraints are an error (fail-closed).
 //! If the PDP returns constraints regardless of the flag, they are compiled.
+//!
+//! ## Empty value lists (fail-closed)
+//!
+//! Set-membership predicates (`In`, `InGroup`, `InGroupSubtree`) with an empty
+//! value list are rejected at compile time. An empty list means "match nothing"
+//! which is semantically a deny — but passing it through to the ORM would
+//! generate `WHERE col IN ()`, which is a SQL error on some engines. Instead
+//! the compiler treats this as a PDP contract violation and fails the
+//! constraint (fail-closed).
 
 use modkit_security::{AccessScope, ScopeConstraint, ScopeFilter, ScopeValue};
 
@@ -127,7 +136,47 @@ fn compile_constraint(
                     .iter()
                     .map(json_to_scope_value)
                     .collect::<Result<_, _>>()?;
+                if values.is_empty() {
+                    return Err(format!(
+                        "In predicate on '{}' has empty value list (fail-closed)",
+                        p.property
+                    ));
+                }
                 (p.property.as_str(), ScopeFilter::r#in(&p.property, values))
+            }
+            Predicate::InGroup(p) => {
+                let group_ids: Vec<ScopeValue> = p
+                    .group_ids
+                    .iter()
+                    .map(json_to_scope_value)
+                    .collect::<Result<_, _>>()?;
+                if group_ids.is_empty() {
+                    return Err(format!(
+                        "InGroup predicate on '{}' has empty group_ids (fail-closed)",
+                        p.property
+                    ));
+                }
+                (
+                    p.property.as_str(),
+                    ScopeFilter::in_group(&p.property, group_ids),
+                )
+            }
+            Predicate::InGroupSubtree(p) => {
+                let ancestor_ids: Vec<ScopeValue> = p
+                    .ancestor_ids
+                    .iter()
+                    .map(json_to_scope_value)
+                    .collect::<Result<_, _>>()?;
+                if ancestor_ids.is_empty() {
+                    return Err(format!(
+                        "InGroupSubtree predicate on '{}' has empty ancestor_ids (fail-closed)",
+                        p.property
+                    ));
+                }
+                (
+                    p.property.as_str(),
+                    ScopeFilter::in_group_subtree(&p.property, ancestor_ids),
+                )
             }
         };
 
@@ -165,6 +214,5 @@ fn json_to_scope_value(v: &serde_json::Value) -> Result<ScopeValue, String> {
 }
 
 #[cfg(test)]
-#[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "compiler_tests.rs"]
 mod compiler_tests;

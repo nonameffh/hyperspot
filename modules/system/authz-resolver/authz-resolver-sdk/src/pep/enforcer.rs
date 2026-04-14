@@ -1,4 +1,4 @@
-// Updated: 2026-04-07 by Constructor Tech
+// Updated: 2026-04-14 by Constructor Tech
 //! Policy Enforcement Point (`PEP`) object.
 //!
 //! [`PolicyEnforcer`] encapsulates the full PEP flow:
@@ -49,7 +49,7 @@ pub enum EnforcerError {
 /// [`PolicyEnforcer::access_scope()`] defaults don't suffice (ABAC resource
 /// properties, custom tenant mode, barrier bypass, etc.).
 ///
-/// All fields default to "not overridden" — only set what you need.
+/// All fields default to "not overridden" - only set what you need.
 ///
 /// # Examples
 ///
@@ -65,7 +65,7 @@ pub enum EnforcerError {
 ///         .resource_property(pep_properties::OWNER_TENANT_ID, target_tenant_id),
 /// ).await?;
 ///
-/// // Billing — ignore barriers (constrained scope)
+/// // Billing - ignore barriers (constrained scope)
 /// let scope = enforcer.access_scope_with(
 ///     &ctx, &RESOURCE, "list", None,
 ///     &AccessRequest::new().barrier_mode(BarrierMode::Ignore),
@@ -251,7 +251,8 @@ impl PolicyEnforcer {
         request: &AccessRequest,
     ) -> EvaluationRequest {
         // Pass through the caller's tenant context as-is.
-        // If no context_tenant_id was set, the PDP determines it by its own rules.
+        // If no context_tenant_id was set, the PDP determines it by its own rules
+        // (e.g. falling back to subject.properties["tenant_id"]).
         let tenant_context = request.tenant_context.clone();
 
         // Put subject's tenant_id into properties per AuthZEN spec
@@ -369,6 +370,5 @@ impl std::fmt::Debug for PolicyEnforcer {
 }
 
 #[cfg(test)]
-#[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "enforcer_tests.rs"]
 mod enforcer_tests;

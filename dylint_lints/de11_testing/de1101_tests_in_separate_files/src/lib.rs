@@ -1,4 +1,5 @@
 // Created: 2026-04-07 by Constructor Tech
+// Updated: 2026-04-14 by Constructor Tech
 #![feature(rustc_private)]
 #![warn(unused_extern_crates)]
 
@@ -26,14 +27,22 @@ const MODULE_PREFIXES: &[&str] = &[
     "plugins/",
 ];
 
+const DEFAULT_MAX_INLINE_TEST_LINES: usize = 100;
+
 #[derive(Default, serde::Deserialize)]
 struct Config {
     #[serde(default)]
     excluded_paths: Vec<String>,
+    /// Maximum number of test lines allowed inline before the linter enforces
+    /// moving them to a separate file. Set to 0 to always require separation.
+    /// Default: 100.
+    #[serde(default)]
+    max_inline_test_lines: Option<usize>,
 }
 
 struct De1101TestsInSeparateFiles {
     excluded_set: HashSet<String>,
+    max_inline_test_lines: usize,
 }
 
 impl De1101TestsInSeparateFiles {
@@ -41,6 +50,9 @@ impl De1101TestsInSeparateFiles {
         let config: Config = dylint_linting::config_or_default(env!("CARGO_PKG_NAME"));
         Self {
             excluded_set: config.excluded_paths.into_iter().collect(),
+            max_inline_test_lines: config
+                .max_inline_test_lines
+                .unwrap_or(DEFAULT_MAX_INLINE_TEST_LINES),
         }
     }
 
@@ -81,7 +93,10 @@ dylint_linting::impl_pre_expansion_lint! {
     /// - integration tests under `tests/`
     /// - dedicated unit-test files named `{source_stem}_tests.rs`
     ///
-    /// Test code is forbidden inline inside production source files.
+    /// Test code is forbidden inline inside production source files when:
+    /// - the inline test block exceeds `max_inline_test_lines` (default: 100), OR
+    /// - a companion `{source_stem}_tests.rs` file already exists (tests must not
+    ///   be split across two files)
     ///
     /// Additionally:
     /// - test module reference must resolve to `{source_stem}_tests.rs`
@@ -97,6 +112,8 @@ dylint_linting::impl_pre_expansion_lint! {
 enum TestViolation {
     /// Inline test code (`#[test]` or `#[cfg(test)] mod tests { ... }`) in a production file.
     InlineTestCode,
+    /// Inline test code when a companion `_tests.rs` file already exists — always denied.
+    InlineTestCodeWithCompanion,
     /// `#[path = "..."]` value does not match `{source_stem}_tests.rs`.
     WrongPathAttr { expected: String, actual: String },
 }
@@ -131,7 +148,13 @@ impl EarlyLintPass for De1101TestsInSeparateFiles {
         }
 
         let source_stem = file_stem(&normalized);
-        let violations = find_test_violations(&source, source_stem.as_deref());
+        let has_companion = has_companion_test_file(&path, source_stem.as_deref());
+        let violations = find_test_violations(
+            &source,
+            source_stem.as_deref(),
+            has_companion,
+            self.max_inline_test_lines,
+        );
 
         for violation in violations {
             match violation {
@@ -140,8 +163,19 @@ impl EarlyLintPass for De1101TestsInSeparateFiles {
                         diag.primary_message(
                             "test code must be moved to a separate test file (DE1101)",
                         );
+                        diag.help(format!(
+                            "move the test into `tests/*.rs` or an out-of-line `*_tests.rs` module (inline test block exceeds {} lines)",
+                            self.max_inline_test_lines,
+                        ));
+                    });
+                }
+                TestViolation::InlineTestCodeWithCompanion => {
+                    cx.span_lint(DE1101_TESTS_IN_SEPARATE_FILES, item.span, |diag| {
+                        diag.primary_message(
+                            "test code must not be added back to a file that already has a companion test file (DE1101)",
+                        );
                         diag.help(
-                            "move the test into `tests/*.rs` or an out-of-line `*_tests.rs` module",
+                            "a `*_tests.rs` companion file already exists; add tests there instead",
                         );
                     });
                 }
@@ -180,10 +214,55 @@ fn file_stem(path: &str) -> Option<String> {
     }
 }
 
+/// Check whether a companion `{stem}_tests.rs` file exists next to the source file.
+fn has_companion_test_file(source_path: &str, source_stem: Option<&str>) -> bool {
+    let Some(stem) = source_stem else {
+        return false;
+    };
+    let parent = match source_path.rfind('/').or_else(|| source_path.rfind('\\')) {
+        Some(pos) => &source_path[..=pos],
+        None => "",
+    };
+    let companion = format!("{parent}{stem}_tests.rs");
+    std::path::Path::new(&companion).exists()
+}
+
+/// Count the number of lines in an inline `#[cfg(test)] mod ... { ... }` block,
+/// starting from the line containing the opening `{`.
+fn count_inline_test_block_lines(lines: &[&str], open_brace_line: usize) -> usize {
+    let mut depth = 0usize;
+    let mut count = 0usize;
+
+    for line in &lines[open_brace_line..] {
+        count += 1;
+        for ch in line.chars() {
+            if ch == '{' {
+                depth += 1;
+            } else if ch == '}' {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return count;
+                }
+            }
+        }
+    }
+
+    count
+}
+
 /// Scan source text for test-declaration violations.
 ///
 /// Returns all violations found (inline code, wrong test file name).
-fn find_test_violations(source: &str, source_stem: Option<&str>) -> Vec<TestViolation> {
+///
+/// - `has_companion`: whether a `{stem}_tests.rs` file exists alongside this file.
+///   If true, any inline test code is unconditionally denied.
+/// - `max_inline_lines`: the threshold below which inline test blocks are tolerated.
+fn find_test_violations(
+    source: &str,
+    source_stem: Option<&str>,
+    has_companion: bool,
+    max_inline_lines: usize,
+) -> Vec<TestViolation> {
     let lines: Vec<&str> = source.lines().collect();
     let mut violations = Vec::new();
     let mut reported_inline = false;
@@ -198,7 +277,11 @@ fn find_test_violations(source: &str, source_stem: Option<&str>) -> Vec<TestViol
 
         // A bare `#[test]` / `#[tokio::test]` in a production file.
         if !reported_inline && is_direct_test_attr(&compact_line) {
-            violations.push(TestViolation::InlineTestCode);
+            if has_companion {
+                violations.push(TestViolation::InlineTestCodeWithCompanion);
+            } else {
+                violations.push(TestViolation::InlineTestCode);
+            }
             reported_inline = true;
             continue;
         }
@@ -256,10 +339,24 @@ fn find_test_violations(source: &str, source_stem: Option<&str>) -> Vec<TestViol
                 break;
             }
 
-            // Anything else is inline test code.
+            // Anything else is inline test code — check threshold.
             if !reported_inline {
-                violations.push(TestViolation::InlineTestCode);
-                reported_inline = true;
+                if has_companion {
+                    violations.push(TestViolation::InlineTestCodeWithCompanion);
+                    reported_inline = true;
+                } else {
+                    // Count the lines in the inline test block.
+                    let block_lines = count_inline_test_block_lines(&lines, next);
+                    // Include the #[cfg(test)] line and any attributes above the block.
+                    let total_test_lines = (next - index) + block_lines;
+
+                    if total_test_lines > max_inline_lines {
+                        violations.push(TestViolation::InlineTestCode);
+                    }
+                    // Mark as reported either way to avoid re-triggering on
+                    // bare `#[test]` lines inside this allowed inline block.
+                    reported_inline = true;
+                }
             }
             break;
         }
@@ -405,8 +502,8 @@ fn is_extern_crate_alias(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_mod_name, extract_path_attr_value, find_test_violations, is_cfg_test_attr,
-        is_path_attr,
+        count_inline_test_block_lines, extract_mod_name, extract_path_attr_value,
+        find_test_violations, is_cfg_test_attr, is_path_attr,
     };
 
     #[test]
@@ -481,7 +578,7 @@ mod handler_tests;
 
 fn main() {}
 "#;
-        let violations = find_test_violations(source, Some("handler"));
+        let violations = find_test_violations(source, Some("handler"), false, 100);
         assert!(violations.is_empty(), "expected no violations");
     }
 
@@ -494,8 +591,11 @@ mod tests;
 
 fn main() {}
 "#;
-        let violations = find_test_violations(source, Some("handler"));
-        assert!(violations.is_empty(), "any mod name should be accepted without #[path]");
+        let violations = find_test_violations(source, Some("handler"), false, 100);
+        assert!(
+            violations.is_empty(),
+            "any mod name should be accepted without #[path]"
+        );
     }
 
     #[test]
@@ -507,7 +607,7 @@ mod tests;
 
 fn main() {}
 "#;
-        let violations = find_test_violations(source, Some("handler"));
+        let violations = find_test_violations(source, Some("handler"), false, 100);
         assert_eq!(violations.len(), 1);
         assert!(matches!(
             &violations[0],
@@ -525,12 +625,12 @@ mod tests;
 
 fn main() {}
 "#;
-        let violations = find_test_violations(source, Some("handler"));
+        let violations = find_test_violations(source, Some("handler"), false, 100);
         assert!(violations.is_empty(), "expected no violations");
     }
 
     #[test]
-    fn test_find_violations_inline_code() {
+    fn test_find_violations_inline_code_over_threshold() {
         let source = r#"
 #[cfg(test)]
 mod tests {
@@ -540,9 +640,58 @@ mod tests {
 
 fn main() {}
 "#;
-        let violations = find_test_violations(source, Some("handler"));
+        // Threshold 3: the test block is 4 lines (mod tests { ... }), trigger.
+        let violations = find_test_violations(source, Some("handler"), false, 3);
         assert!(violations
             .iter()
             .any(|v| matches!(v, super::TestViolation::InlineTestCode)));
+    }
+
+    #[test]
+    fn test_find_violations_inline_code_under_threshold() {
+        let source = r#"
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn foo() {}
+}
+
+fn main() {}
+"#;
+        // Threshold 100: the test block is ~6 lines total, allow.
+        let violations = find_test_violations(source, Some("handler"), false, 100);
+        assert!(violations.is_empty(), "expected no violations under threshold");
+    }
+
+    #[test]
+    fn test_find_violations_inline_code_with_companion() {
+        let source = r#"
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn foo() {}
+}
+
+fn main() {}
+"#;
+        // Even tiny inline tests are denied when companion exists.
+        let violations = find_test_violations(source, Some("handler"), true, 100);
+        assert!(violations
+            .iter()
+            .any(|v| matches!(v, super::TestViolation::InlineTestCodeWithCompanion)));
+    }
+
+    #[test]
+    fn test_count_inline_test_block_lines() {
+        let source = "mod tests {\n    #[test]\n    fn foo() {}\n}\n";
+        let lines: Vec<&str> = source.lines().collect();
+        assert_eq!(count_inline_test_block_lines(&lines, 0), 4);
+    }
+
+    #[test]
+    fn test_count_inline_test_block_lines_nested() {
+        let source = "mod tests {\n    fn foo() {\n        if true {\n        }\n    }\n}\n";
+        let lines: Vec<&str> = source.lines().collect();
+        assert_eq!(count_inline_test_block_lines(&lines, 0), 6);
     }
 }
