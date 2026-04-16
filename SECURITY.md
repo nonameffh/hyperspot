@@ -7,7 +7,7 @@
 Report vulnerabilities via:
 
 1. **GitHub Security Advisories**: Report privately at [cyberfabric/cyberfabric-core/security/advisories/new](https://github.com/cyberfabric/cyberfabric-core/security/advisories/new)
-2. **Direct Contact**: Email security team (security@acronis.com) or  [maintainers](MAINTAINERS.md) directly
+2. **Direct Contact**: Email security team (security@acronis.com) and  [maintainers](MAINTAINERS.md) directly
 
 ### Required Information
 
