@@ -119,7 +119,7 @@ impl Module for MiniChatModule {
     async fn init(&self, ctx: &ModuleCtx) -> anyhow::Result<()> {
         info!("Initializing {} module", Self::MODULE_NAME);
 
-        let mut cfg: crate::config::MiniChatConfig = ctx.config_expanded()?;
+        let mut cfg: crate::config::MiniChatConfig = ctx.config_expanded_or_default()?;
         cfg.streaming
             .validate()
             .map_err(|e| anyhow::anyhow!("streaming config: {e}"))?;
@@ -155,6 +155,9 @@ impl Module for MiniChatModule {
         cfg.thumbnail
             .validate()
             .map_err(|e| anyhow::anyhow!("thumbnail config: {e}"))?;
+        cfg.rag
+            .validate()
+            .map_err(|e| anyhow::anyhow!("rag config: {e}"))?;
 
         let vendor = cfg.vendor.trim().to_owned();
         if vendor.is_empty() {
@@ -544,7 +547,7 @@ impl RunnableCapability for MiniChatModule {
                     metrics: Arc::clone(&od.metrics),
                 })
                 .lease(LeaseConfig {
-                    duration: Duration::from_secs(60),
+                    duration: Duration::from_mins(1),
                     ..LeaseConfig::default()
                 })
                 .start()
